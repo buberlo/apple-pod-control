@@ -5,6 +5,14 @@ Apple Pod Control (APC) is a lightweight, Kubernetes-inspired orchestrator for
 plane schedules isolated ARM64 Linux micro-VM workloads across Apple Silicon
 Macs; a local agent drives Apple's native `container` CLI.
 
+APC v2 is now being developed on a separate path that runs a real K3s control
+plane inside an Apple container VM. This makes native `kubectl` and Helm
+available without emulating more Kubernetes APIs. The tested design decision is
+recorded in [ADR 0001](docs/adr/0001-k3s-control-plane.md), and the isolated
+[K3s spike quickstart](docs/k3s-spike.md) does not disturb an APC v1 cluster.
+The [two-Mac validation report](docs/k3s-spike-results.md) records what passed
+and the Apple runtime networking issue found during restart testing.
+
 This repository is an MVP: it is useful for development and trusted LAN labs,
 but it is not a production replacement for Kubernetes. The architecture and
 failure behavior are documented in [docs/architecture.md](docs/architecture.md).
@@ -53,6 +61,27 @@ Binaries are written to `bin/apc`, `bin/apc-server`, and `bin/apc-agent`.
 `make install` copies them to `~/.local/bin` by default; override this with
 `PREFIX=/usr/local make install` when a system-wide installation is desired.
 Ensure `~/.local/bin` is present in your shell's `PATH`.
+
+## APC v2 K3s spike
+
+Check the Mac and create a local Kubernetes node on the isolated development
+port `16443`:
+
+```bash
+bin/apc doctor
+bin/apc cluster create spike
+export KUBECONFIG="$(bin/apc kubeconfig path spike)"
+
+kubectl get nodes
+helm upgrade --install web examples/helm/web --wait
+kubectl port-forward service/web-apc-web 18081:80
+```
+
+The K3s version and multi-platform OCI image digest are pinned in code. The
+node runs ARM64 natively and uses VXLAN because Apple container 1.0's guest
+kernel does not provide a WireGuard interface. Kubernetes state lives on an
+APC-labelled Apple volume; `apc cluster start` recreates the lightweight VM
+envelope and reattaches that volume.
 
 ## Local development smoke test
 

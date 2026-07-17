@@ -17,6 +17,8 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/buberlo/apple-pod-control/internal/client"
+	"github.com/buberlo/apple-pod-control/internal/cluster"
+	"github.com/buberlo/apple-pod-control/internal/doctor"
 	"github.com/buberlo/apple-pod-control/internal/model"
 )
 
@@ -53,9 +55,287 @@ func NewCommand(out, errOut io.Writer) *cobra.Command {
 	command.PersistentFlags().DurationVar(&options.requestTimeout, "request-timeout", 30*time.Second, "request timeout")
 	command.AddCommand(
 		options.applyCommand(), options.getCommand(), options.describeCommand(), options.deleteCommand(),
-		options.rolloutCommand(), options.scaleCommand(), options.versionCommand(),
+		options.rolloutCommand(), options.scaleCommand(), options.versionCommand(), options.doctorCommand(),
+		options.clusterCommand(), options.nodeCommand(), options.kubeconfigCommand(), options.kubectlCommand(),
 	)
 	return command
+}
+
+func (o *options) doctorCommand() *cobra.Command {
+	var role, listenAddress, peer, outputFormat string
+	var apiPort, vxlanPort int
+	command := &cobra.Command{
+		Use:   "doctor",
+		Short: "Check whether this Mac can host an APC Kubernetes node",
+		RunE: func(command *cobra.Command, _ []string) error {
+			report := doctor.Run(command.Context(), doctor.Options{
+				Role: role, ListenAddress: listenAddress, APIPort: apiPort, FlannelPort: vxlanPort, Peer: peer,
+			})
+			var err error
+			switch outputFormat {
+			case "", "text":
+				err = report.WriteText(o.out)
+			case "json":
+				err = report.WriteJSON(o.out)
+			default:
+				return fmt.Errorf("unsupported output format %q; use text or json", outputFormat)
+			}
+			if err != nil {
+				return err
+			}
+			if report.FailureCount() > 0 {
+				return fmt.Errorf("%d required checks failed", report.FailureCount())
+			}
+			return nil
+		},
+	}
+	command.Flags().StringVar(&role, "role", "server", "node role: server or agent")
+	command.Flags().StringVar(&listenAddress, "listen-address", "127.0.0.1", "host address reserved for published ports")
+	command.Flags().IntVar(&apiPort, "api-port", cluster.DefaultAPIPort, "host port for the Kubernetes API")
+	command.Flags().IntVar(&vxlanPort, "vxlan-port", cluster.DefaultVXLANPort, "host UDP port for Flannel VXLAN")
+	command.Flags().StringVar(&peer, "peer", "", "optional peer hostname or IP whose SSH reachability is checked")
+	command.Flags().StringVarP(&outputFormat, "output", "o", "text", "output format: text or json")
+	return command
+}
+
+func (o *options) clusterCommand() *cobra.Command {
+	command := &cobra.Command{Use: "cluster", Short: "Manage Kubernetes clusters hosted by apple/container"}
+	command.AddCommand(
+		o.clusterCreateCommand(), o.clusterStatusCommand(), o.clusterStartCommand(), o.clusterStopCommand(), o.clusterWriteJoinTokenCommand(),
+	)
+	return command
+}
+
+func (o *options) clusterCreateCommand() *cobra.Command {
+	config := cluster.Config{DisableTraefik: true}
+	command := &cobra.Command{
+		Use:   "create [NAME]",
+		Short: "Create an isolated ARM64 K3s server node",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(command *cobra.Command, args []string) error {
+			if len(args) == 1 {
+				config.Name = args[0]
+			}
+			manager := cluster.NewManager("container")
+			state, err := manager.Create(command.Context(), config)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(o.out, "cluster.apc.dev/%s ready\n", state.Name)
+			fmt.Fprintf(o.out, "node/%s Ready (%s)\n", state.NodeName, state.K3sVersion)
+			fmt.Fprintf(o.out, "kubeconfig: %s\n", state.Kubeconfig)
+			fmt.Fprintf(o.out, "export KUBECONFIG=%q\n", state.Kubeconfig)
+			return nil
+		},
+	}
+	command.Flags().StringVar(&config.NodeName, "node-name", "", "Kubernetes node name")
+	command.Flags().StringVar(&config.Image, "image", cluster.DefaultK3sImage, "pinned K3s OCI image")
+	command.Flags().IntVar(&config.CPUs, "cpus", 4, "virtual CPUs allocated to the node")
+	command.Flags().StringVar(&config.Memory, "memory", "4G", "memory allocated to the node")
+	command.Flags().StringVar(&config.ListenAddress, "listen-address", "127.0.0.1", "host address used for port publishing")
+	command.Flags().StringVar(&config.AdvertiseAddress, "advertise-address", "", "LAN address advertised to other nodes")
+	command.Flags().IntVar(&config.APIPort, "api-port", cluster.DefaultAPIPort, "host port for the Kubernetes API")
+	command.Flags().IntVar(&config.VXLANPort, "vxlan-port", cluster.DefaultVXLANPort, "host UDP port for Flannel VXLAN")
+	command.Flags().IntVar(&config.KubeletPort, "kubelet-port", cluster.DefaultKubeletPort, "host port for kubelet")
+	command.Flags().DurationVar(&config.StartupTimeout, "wait", 2*time.Minute, "maximum time to wait for a Ready node")
+	command.Flags().StringVar(&config.KubeconfigPath, "kubeconfig", "", "kubeconfig destination")
+	command.Flags().BoolVar(&config.DisableTraefik, "disable-ingress", true, "disable bundled Traefik and ServiceLB during the spike")
+	return command
+}
+
+func (o *options) clusterStatusCommand() *cobra.Command {
+	var outputFormat string
+	command := &cobra.Command{
+		Use:   "status [NAME]",
+		Short: "Show the K3s server and Kubernetes node state",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(command *cobra.Command, args []string) error {
+			name := clusterName(args)
+			state, err := cluster.NewManager("container").Status(command.Context(), name)
+			if err != nil {
+				return err
+			}
+			if outputFormat == "json" || outputFormat == "yaml" {
+				return printObject(o.out, state, outputFormat)
+			}
+			if outputFormat != "" && outputFormat != "wide" {
+				return fmt.Errorf("unsupported output format %q; use json, yaml, or wide", outputFormat)
+			}
+			writer := tabwriter.NewWriter(o.out, 0, 4, 2, ' ', 0)
+			fmt.Fprintln(writer, "NAME\tRUNTIME\tNODE\tREADY\tVERSION\tAPI")
+			fmt.Fprintf(writer, "%s\t%s\t%s\t%t\t%s\t%s\n", state.Name, state.RuntimeState, state.NodeName, state.NodeReady, state.K3sVersion, state.APIEndpoint)
+			return writer.Flush()
+		},
+	}
+	command.Flags().StringVarP(&outputFormat, "output", "o", "", "output format: json, yaml, or wide")
+	return command
+}
+
+func (o *options) clusterStartCommand() *cobra.Command {
+	var timeout time.Duration
+	command := &cobra.Command{
+		Use:   "start [NAME]",
+		Short: "Start a stopped APC K3s node",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(command *cobra.Command, args []string) error {
+			state, err := cluster.NewManager("container").Start(command.Context(), clusterName(args), timeout)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(o.out, "cluster.apc.dev/%s ready\n", state.Name)
+			return nil
+		},
+	}
+	command.Flags().DurationVar(&timeout, "wait", 2*time.Minute, "maximum time to wait for a Ready node")
+	return command
+}
+
+func (o *options) clusterStopCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "stop [NAME]",
+		Short: "Stop an APC K3s node without deleting its state",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(command *cobra.Command, args []string) error {
+			name := clusterName(args)
+			if err := cluster.NewManager("container").Stop(command.Context(), name); err != nil {
+				return err
+			}
+			fmt.Fprintf(o.out, "cluster.apc.dev/%s stopped\n", name)
+			return nil
+		},
+	}
+}
+
+func (o *options) clusterWriteJoinTokenCommand() *cobra.Command {
+	var outputPath string
+	command := &cobra.Command{
+		Use:   "write-join-token [NAME]",
+		Short: "Write a K3s agent token to a protected file",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(command *cobra.Command, args []string) error {
+			name := clusterName(args)
+			path, err := cluster.NewManager("container").WriteAgentToken(command.Context(), name, outputPath)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(o.out, "join token written to %s (mode 0600)\n", path)
+			return nil
+		},
+	}
+	command.Flags().StringVarP(&outputPath, "output", "o", "", "protected output file; defaults to the cluster configuration directory")
+	return command
+}
+
+func (o *options) nodeCommand() *cobra.Command {
+	command := &cobra.Command{Use: "node", Short: "Manage K3s worker nodes on this Mac"}
+	command.AddCommand(o.nodeJoinCommand(), o.nodeStatusCommand())
+	return command
+}
+
+func (o *options) nodeJoinCommand() *cobra.Command {
+	config := cluster.AgentConfig{}
+	command := &cobra.Command{
+		Use:   "join [CLUSTER]",
+		Short: "Join this Mac to an APC K3s cluster",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(command *cobra.Command, args []string) error {
+			config.Name = clusterName(args)
+			state, err := cluster.NewManager("container").Join(command.Context(), config)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(o.out, "node.apc.dev/%s connected (%s)\n", state.NodeName, state.RuntimeState)
+			return nil
+		},
+	}
+	command.Flags().StringVar(&config.NodeName, "node-name", "", "unique Kubernetes node name")
+	command.Flags().StringVar(&config.ServerURL, "server-url", "", "K3s server URL, for example https://192.0.2.10:16443")
+	command.Flags().StringVar(&config.TokenFile, "token-file", "", "path to a mode-0600 K3s agent token")
+	command.Flags().StringVar(&config.Image, "image", cluster.DefaultK3sImage, "pinned K3s OCI image")
+	command.Flags().IntVar(&config.CPUs, "cpus", 2, "virtual CPUs allocated to the node")
+	command.Flags().StringVar(&config.Memory, "memory", "2G", "memory allocated to the node")
+	command.Flags().StringVar(&config.ListenAddress, "listen-address", "0.0.0.0", "host address used for port publishing")
+	command.Flags().StringVar(&config.AdvertiseAddress, "advertise-address", "", "this Mac's trusted-LAN address")
+	command.Flags().IntVar(&config.VXLANPort, "vxlan-port", cluster.DefaultVXLANPort, "host UDP port for Flannel VXLAN")
+	command.Flags().IntVar(&config.KubeletPort, "kubelet-port", cluster.DefaultKubeletPort, "host port for kubelet")
+	command.Flags().DurationVar(&config.StartupTimeout, "wait", 45*time.Second, "maximum time to wait for the agent connection")
+	return command
+}
+
+func (o *options) nodeStatusCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "status [CLUSTER]",
+		Short: "Show this Mac's K3s agent VM state",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(command *cobra.Command, args []string) error {
+			state, err := cluster.NewManager("container").AgentStatus(command.Context(), clusterName(args))
+			if err != nil {
+				return err
+			}
+			writer := tabwriter.NewWriter(o.out, 0, 4, 2, ' ', 0)
+			fmt.Fprintln(writer, "CLUSTER\tCONTAINER\tRUNTIME\tADDRESS")
+			fmt.Fprintf(writer, "%s\t%s\t%s\t%s\n", state.Name, state.Container, state.RuntimeState, state.Address)
+			return writer.Flush()
+		},
+	}
+}
+
+func (o *options) kubeconfigCommand() *cobra.Command {
+	command := &cobra.Command{Use: "kubeconfig", Short: "Locate APC-managed Kubernetes credentials"}
+	command.AddCommand(&cobra.Command{
+		Use:   "path [CLUSTER]",
+		Short: "Print the kubeconfig path",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			path, err := cluster.KubeconfigPath(clusterName(args))
+			if err != nil {
+				return err
+			}
+			_, err = fmt.Fprintln(o.out, path)
+			return err
+		},
+	})
+	return command
+}
+
+func (o *options) kubectlCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:                "kubectl CLUSTER -- COMMAND [ARG...]",
+		Short:              "Run the K3s-bundled kubectl (bootstrap convenience)",
+		DisableFlagParsing: true,
+		Args:               cobra.MinimumNArgs(2),
+		RunE: func(command *cobra.Command, args []string) error {
+			name := args[0]
+			arguments := args[1:]
+			if arguments[0] == "--" {
+				arguments = arguments[1:]
+			}
+			if len(arguments) == 0 {
+				return fmt.Errorf("kubectl command is required")
+			}
+			stdout, stderr, err := cluster.NewManager("container").Kubectl(command.Context(), name, arguments...)
+			if len(stdout) > 0 {
+				_, _ = o.out.Write(stdout)
+			}
+			if len(stderr) > 0 {
+				_, _ = o.errOut.Write(stderr)
+			}
+			if err != nil {
+				return fmt.Errorf("kubectl failed: %w", err)
+			}
+			return nil
+		},
+	}
+}
+
+func clusterName(args []string) string {
+	if len(args) > 0 && args[0] != "" {
+		return args[0]
+	}
+	if value := os.Getenv("APC_CLUSTER"); value != "" {
+		return value
+	}
+	return "spike"
 }
 
 func (o *options) apiClient() (*client.Client, error) {
