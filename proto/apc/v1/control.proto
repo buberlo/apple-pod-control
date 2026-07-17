@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package apc.v1;
+
+option go_package = "github.com/buberlo/apple-pod-control/gen/apc/v1;apcv1";
+
+service AgentControl {
+  // Connect is a long-lived, bidirectional control channel. Agents send
+  // registration, heartbeats and observations; the server sends commands.
+  rpc Connect(stream AgentMessage) returns (stream ControlMessage);
+}
+
+enum AgentMessageType {
+  AGENT_MESSAGE_TYPE_UNSPECIFIED = 0;
+  AGENT_MESSAGE_TYPE_REGISTER = 1;
+  AGENT_MESSAGE_TYPE_HEARTBEAT = 2;
+  AGENT_MESSAGE_TYPE_STATUS = 3;
+  AGENT_MESSAGE_TYPE_ACK = 4;
+}
+
+enum CommandOperation {
+  COMMAND_OPERATION_UNSPECIFIED = 0;
+  COMMAND_OPERATION_START = 1;
+  COMMAND_OPERATION_STOP = 2;
+}
+
+message NodeInfo {
+  string id = 1;
+  string hostname = 2;
+  string address = 3;
+  string architecture = 4;
+  int32 cpu_count = 5;
+  int64 memory_bytes = 6;
+  map<string, string> labels = 7;
+  string runtime_version = 8;
+}
+
+message Port {
+  string name = 1;
+  int32 container_port = 2;
+  int32 host_port = 3;
+  string protocol = 4;
+  string host_ip = 5;
+}
+
+message HealthCheck {
+  string type = 1;
+  string path = 2;
+  int32 port = 3;
+  repeated string command = 4;
+  int32 initial_delay_seconds = 5;
+  int32 interval_seconds = 6;
+  int32 timeout_seconds = 7;
+  int32 failure_threshold = 8;
+}
+
+message WorkloadCommand {
+  string command_id = 1;
+  CommandOperation operation = 2;
+  string workload_id = 3;
+  string container_name = 4;
+  string image = 5;
+  map<string, string> environment = 6;
+  repeated Port ports = 7;
+  repeated string arguments = 8;
+  int32 cpus = 9;
+  string memory = 10;
+  HealthCheck readiness = 11;
+  HealthCheck liveness = 12;
+  string architecture = 13;
+}
+
+message WorkloadObservation {
+  string workload_id = 1;
+  string container_name = 2;
+  string state = 3;
+  bool ready = 4;
+  string message = 5;
+  string address = 6;
+  int32 restart_count = 7;
+}
+
+message AgentMessage {
+  AgentMessageType type = 1;
+  string node_id = 2;
+  NodeInfo node = 3;
+  repeated WorkloadObservation workloads = 4;
+  string command_id = 5;
+  string error = 6;
+}
+
+message ControlMessage {
+  WorkloadCommand command = 1;
+}

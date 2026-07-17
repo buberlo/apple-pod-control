@@ -1,0 +1,103 @@
+# Architecture
+
+Apple Pod Control (APC) is a deliberately small, Kubernetes-inspired control
+plane for a trusted fleet of Apple Silicon Macs. It does not embed Kubernetes;
+it borrows the parts operators value most: a declarative API, an `apply`-based
+workflow, labels and selectors, reconciliation, scheduling, probes,
+self-healing, rolling updates, namespaces, and familiar resource views.
+
+## High-level diagram
+
+```text
+                     HTTPS / Kubernetes-shaped JSON
+  deployment.yaml ── apc CLI ───────────────────────────────┐
+                                                            v
+  ┌────────────────────────── CONTROL PLANE (Go) ──────────────────────────┐
+  │ REST API Server ──> Validation/defaulting ──> SQLite (WAL) Desired State│
+  │       │                                            │                   │
+  │       └──────── Deployment Controller <────────────┘                   │
+  │                           │                                            │
+  │                     Scheduler                                          │
+  │         (labels, requests, ARM64, host ports, least-loaded)            │
+  │                           │                                            │
+  │                  gRPC Session Registry                                 │
+  └───────────────────────────┬────────────────────────────────────────────┘
+                              │ long-lived bidirectional gRPC
+                 ┌────────────┴────────────┐
+                 v                         v
+  ┌──────────── MacBook ───────────┐  ┌─────────── Mac mini ────────────┐
+  │ apc-agent                      │  │ apc-agent                       │
+  │ heartbeat / probes / reconcile │  │ heartbeat / probes / reconcile │
+  │         │                      │  │         │                       │
+  │ apple/container 1.0 CLI        │  │ apple/container 1.0 CLI         │
+  │         │                      │  │         │                       │
+  │ isolated ARM64 micro-VMs       │  │ isolated ARM64 micro-VMs        │
+  └────────────────────────────────┘  └─────────────────────────────────┘
+```
+
+## Kubernetes concepts retained
+
+| Kubernetes behavior | APC implementation |
+|---|---|
+| Declarative desired state | `apc apply -f`, persisted deployment objects |
+| API objects | `apiVersion`, `kind`, `metadata`, `spec`, `status` |
+| Namespaces and labels | Namespaced deployments/pods, labels, node selectors |
+| Controllers | Level-triggered deployment reconciliation loop |
+| Scheduler | Filters by readiness, ARM64, node labels, CPU/RAM and host ports; scores least-loaded nodes |
+| Pods | One APC workload maps to one `apple/container` lightweight VM |
+| Probes | HTTP, TCP and exec readiness/liveness probes |
+| Self-healing | Agent restarts on liveness failure; controller replaces exited workloads |
+| Rollouts | `RollingUpdate` (`maxSurge`, `maxUnavailable`) and `Recreate` |
+| kubectl-style UX | `apply`, `get`, `describe`, `delete`, `scale`, `rollout status`, `-n`, `-o` |
+
+APC intentionally omits admission webhooks, CRDs, multi-container Pods,
+Services/Ingress, distributed consensus and cloud-provider integrations in the
+MVP. SQLite provides excellent single-control-plane latency but not HA. The API
+and controller boundaries allow SQLite to be replaced by an etcd-backed store
+when multi-control-plane availability becomes necessary.
+
+## Reconciliation and failure handling
+
+1. The REST API validates/defaults an object and atomically increments its
+   generation only when `spec` changes.
+2. The deployment controller compares current workloads with the desired
+   generation and replica count.
+3. Rolling updates create up to `maxSurge` new workloads and retire old ones
+   while respecting `maxUnavailable`.
+4. The scheduler selects a connected, ready ARM64 node. Static host ports are
+   treated as per-node exclusive resources.
+5. Commands are deduplicated per workload and operation while in flight. The
+   `container run` path is idempotent across reconnects.
+6. Agents heartbeat every five seconds. Nodes become `NotReady` after 15
+   seconds without a heartbeat.
+7. Agents observe `container inspect` output every two seconds. Readiness gates
+   rollout availability; repeated liveness failures restart the VM locally.
+8. If a process exits, the controller terminates the stale workload record and
+   creates a replacement.
+
+## Apple Silicon runtime choices
+
+- Every run explicitly selects `--arch arm64`, avoiding Rosetta and x86 image
+  translation.
+- Default APC requests/limits are 1 CPU and 512 MB when omitted, reducing the
+  per-VM footprint compared with the `container` defaults. Limits are passed to
+  `container run --cpus/--memory`.
+- The agent uses the `container` 1.0 machine-readable `inspect` JSON rather
+  than scraping tables.
+- Image pulls and VM boot stay node-local. The persistent gRPC channel and
+  two-second observation loop keep control latency small.
+- SQLite uses WAL mode and a five-second busy timeout; the control plane uses a
+  single connection to retain deterministic write ordering.
+
+## Security boundary
+
+The default local-development mode is plaintext. A LAN deployment should use:
+
+- TLS 1.3 on REST and gRPC (`--tls-cert`, `--tls-key`);
+- a private CA plus `--client-ca` for agent mutual TLS;
+- an `APC_TOKEN` bearer token for `apc` REST access;
+- a dedicated macOS user and LaunchAgent/LaunchDaemon for `apc-agent`.
+
+Environment variables in this MVP are stored in plaintext. Do not put secrets
+there; a Secret API with encrypted-at-rest values is a follow-up.
+
