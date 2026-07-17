@@ -46,9 +46,13 @@ its own lightweight VM. APC uses the CLI contract from the 1.0 release:
 ```bash
 make test
 make build
+make install
 ```
 
 Binaries are written to `bin/apc`, `bin/apc-server`, and `bin/apc-agent`.
+`make install` copies them to `~/.local/bin` by default; override this with
+`PREFIX=/usr/local make install` when a system-wide installation is desired.
+Ensure `~/.local/bin` is present in your shell's `PATH`.
 
 ## Local development smoke test
 

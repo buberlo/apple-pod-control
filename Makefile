@@ -3,6 +3,8 @@
 GO ?= go
 PROTOC ?= protoc
 BIN_DIR ?= bin
+PREFIX ?= $(HOME)/.local
+INSTALL_BIN_DIR ?= $(PREFIX)/bin
 
 all: test build
 
@@ -25,10 +27,10 @@ generate:
 		proto/apc/v1/control.proto
 
 install: build
-	install -m 0755 $(BIN_DIR)/apc /usr/local/bin/apc
-	install -m 0755 $(BIN_DIR)/apc-server /usr/local/bin/apc-server
-	install -m 0755 $(BIN_DIR)/apc-agent /usr/local/bin/apc-agent
+	install -d $(DESTDIR)$(INSTALL_BIN_DIR)
+	install -m 0755 $(BIN_DIR)/apc $(DESTDIR)$(INSTALL_BIN_DIR)/apc
+	install -m 0755 $(BIN_DIR)/apc-server $(DESTDIR)$(INSTALL_BIN_DIR)/apc-server
+	install -m 0755 $(BIN_DIR)/apc-agent $(DESTDIR)$(INSTALL_BIN_DIR)/apc-agent
 
 clean:
 	rm -rf $(BIN_DIR)
-
