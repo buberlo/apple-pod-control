@@ -74,10 +74,19 @@ bin/apc get pods -o wide
 bin/apc rollout status deployment/web --timeout=30s
 ```
 
-The example requests two replicas with static host port 8080. Since host ports
+The example requests two replicas with static host port 18080. Since host ports
 are exclusive per node, the scheduler intentionally places one replica on each
 of two Macs. With one node, the second Pod remains `Pending` and explains why
 in `apc describe deployment web`.
+
+## Hardware validation
+
+The end-to-end path has been exercised with `apple/container` 1.0.0 on an
+Apple M3 Pro MacBook and an Apple M2 Mac mini. The test covered native ARM64 VM
+startup, one replica per node, HTTP readiness/liveness, a rolling update,
+scale-up/down without replacing existing Pods, control-plane restart and agent
+re-adoption, and deletion of both VMs. No host-specific addresses or
+credentials are required by the repository.
 
 ## Two-Mac LAN setup
 
@@ -122,4 +131,3 @@ Pod because `apple/container` maps each container to one micro-VM.
 
 MIT. Apple Pod Control is an independent project and is not affiliated with or
 endorsed by Apple Inc. or the Kubernetes project.
-

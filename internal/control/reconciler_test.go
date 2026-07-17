@@ -78,6 +78,7 @@ func TestRollingUpdateKeepsAvailableOldReplica(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	oldRevision := stored.TemplateRevision()
 	deployment.Spec.Template.Spec.Containers[0].Image = "api:v2"
 	updated, _, err := database.UpsertDeployment(ctx, deployment)
 	if err != nil || updated.Metadata.Generation != stored.Metadata.Generation+1 {
@@ -88,20 +89,182 @@ func TestRollingUpdateKeepsAvailableOldReplica(t *testing.T) {
 	}
 	workloads, _ := database.ListWorkloads(ctx)
 	activeOld := 0
-	newGeneration := 0
+	newRevision := 0
 	for _, workload := range workloads {
-		if workload.Generation == stored.Metadata.Generation && workload.State != "Stopping" {
+		if workload.Revision == oldRevision && workload.State != "Stopping" {
 			activeOld++
 		}
-		if workload.Generation == updated.Metadata.Generation {
-			newGeneration++
+		if workload.Revision == updated.TemplateRevision() {
+			newRevision++
 		}
 	}
 	if activeOld == 0 {
 		t.Fatalf("rolling update retired every available old replica: %#v", workloads)
 	}
-	if newGeneration == 0 {
+	if newRevision == 0 {
 		t.Fatalf("rolling update did not create a new generation: %#v", workloads)
+	}
+}
+
+func TestScaleKeepsExistingTemplateRevision(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	ctx := context.Background()
+	deployment := controlTestDeployment()
+	stored, _, err := database.UpsertDeployment(ctx, deployment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconciler := NewReconciler(database, NewSessions(), slog.Default(), time.Second)
+	if err := reconciler.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := database.ListWorkloads(ctx)
+	deployment.Spec.Replicas = 3
+	scaled, _, err := database.UpsertDeployment(ctx, deployment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scaled.Metadata.Generation == stored.Metadata.Generation {
+		t.Fatal("scale should increment Deployment generation")
+	}
+	if scaled.TemplateRevision() != stored.TemplateRevision() {
+		t.Fatal("scale changed the pod template revision")
+	}
+	if err := reconciler.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := database.ListWorkloads(ctx)
+	if len(after) != 3 {
+		t.Fatalf("scaled workloads = %d, want 3", len(after))
+	}
+	for _, existing := range before {
+		found := false
+		for _, current := range after {
+			if current.ID == existing.ID && current.State != "Stopping" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("scale replaced existing workload %s", existing.ID)
+		}
+	}
+}
+
+func TestStartFailureEntersBackoff(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	ctx := context.Background()
+	deployment, _, err := database.UpsertDeployment(ctx, controlTestDeployment())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workload := newWorkload(deployment, 0)
+	workload.NodeID = "node"
+	workload.State = "Assigned"
+	if err := database.CreateWorkload(ctx, workload); err != nil {
+		t.Fatal(err)
+	}
+	reconciler := NewReconciler(database, NewSessions(), slog.Default(), time.Second)
+	command := startCommand(deployment, workload)
+	if err := reconciler.HandleAck(ctx, command, "port already in use"); err != nil {
+		t.Fatal(err)
+	}
+	workloads, err := database.ListWorkloads(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workloads[0].State != "Backoff" || workloads[0].NodeID != "" {
+		t.Fatalf("unexpected failed workload: %#v", workloads[0])
+	}
+}
+
+func TestStoppingWorkloadKeepsHostPortReserved(t *testing.T) {
+	deployment := controlTestDeployment()
+	deployment.Spec.Template.Spec.Containers[0].Ports = []model.ContainerPort{{ContainerPort: 80, HostPort: 18080, Protocol: "TCP"}}
+	if err := deployment.DefaultAndValidate(); err != nil {
+		t.Fatal(err)
+	}
+	workload := newWorkload(deployment, 0)
+	workload.NodeID = "node"
+	workload.State = "Stopping"
+	deployments := map[string]model.Deployment{deployment.Key(): deployment}
+	if !hostPortConflict("node", deployment, []model.Workload{workload}, deployments) {
+		t.Fatal("stopping workload released its host port before deletion acknowledgement")
+	}
+}
+
+func TestStoppingWorkloadIsRedrivenAfterControlPlaneRestart(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	ctx := context.Background()
+	deployment, _, err := database.UpsertDeployment(ctx, controlTestDeployment())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workload := newWorkload(deployment, 0)
+	workload.NodeID = "node"
+	workload.State = "Stopping"
+	if err := database.CreateWorkload(ctx, workload); err != nil {
+		t.Fatal(err)
+	}
+	sessions := NewSessions()
+	current, remove := sessions.Add("node")
+	defer remove()
+	reconciler := NewReconciler(database, sessions, slog.Default(), time.Second)
+	if err := reconciler.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(current.commands) != 1 {
+		t.Fatalf("expected one re-driven stop command, got %d", len(current.commands))
+	}
+	if command := <-current.commands; command.Command.GetOperation().String() != "COMMAND_OPERATION_STOP" {
+		t.Fatalf("expected stop command, got %s", command.Command.GetOperation())
+	}
+}
+
+func TestUnknownWorkloadIsAdoptedAfterAgentReconnect(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	ctx := context.Background()
+	deployment, _, err := database.UpsertDeployment(ctx, controlTestDeployment())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workload := newWorkload(deployment, 0)
+	workload.NodeID = "node"
+	workload.State = "Running"
+	workload.Ready = true
+	if err := database.CreateWorkload(ctx, workload); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.MarkNodeWorkloadsUnknown(ctx, "node", "agent reconnected"); err != nil {
+		t.Fatal(err)
+	}
+	sessions := NewSessions()
+	current, remove := sessions.Add("node")
+	defer remove()
+	reconciler := NewReconciler(database, sessions, slog.Default(), time.Second)
+	if err := reconciler.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(current.commands) != 1 {
+		t.Fatalf("expected one adoption start command, got %d", len(current.commands))
+	}
+	if command := <-current.commands; command.Command.GetOperation().String() != "COMMAND_OPERATION_START" {
+		t.Fatalf("expected start command, got %s", command.Command.GetOperation())
 	}
 }
 

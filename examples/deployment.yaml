@@ -28,7 +28,8 @@ spec:
           ports:
             - name: http
               containerPort: 80
-              hostPort: 8080
+              # Keep this distinct from the APC API server's default port 8080.
+              hostPort: 18080
               hostIP: 0.0.0.0
               protocol: TCP
           env:
@@ -55,4 +56,3 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 2
             failureThreshold: 3
-

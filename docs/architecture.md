@@ -60,20 +60,30 @@ when multi-control-plane availability becomes necessary.
 
 1. The REST API validates/defaults an object and atomically increments its
    generation only when `spec` changes.
-2. The deployment controller compares current workloads with the desired
-   generation and replica count.
+2. The deployment controller compares a stable hash of the Pod template and
+   the replica count. Scaling increments the Deployment generation but does not
+   replace Pods whose template is unchanged.
 3. Rolling updates create up to `maxSurge` new workloads and retire old ones
    while respecting `maxUnavailable`.
 4. The scheduler selects a connected, ready ARM64 node. Static host ports are
    treated as per-node exclusive resources.
 5. Commands are deduplicated per workload and operation while in flight. The
-   `container run` path is idempotent across reconnects.
+   `container run` and stop/delete paths are idempotent across reconnects.
 6. Agents heartbeat every five seconds. Nodes become `NotReady` after 15
    seconds without a heartbeat.
-7. Agents observe `container inspect` output every two seconds. Readiness gates
+7. After an agent reconnect, its assigned workloads become `Unknown`; the
+   controller re-drives their start commands so the agent adopts existing VMs
+   and resumes probes without recreating them.
+8. Agents observe `container inspect` output every two seconds. Readiness gates
    rollout availability; repeated liveness failures restart the VM locally.
-8. If a process exits, the controller terminates the stale workload record and
-   creates a replacement.
+9. Failed starts enter a bounded retry backoff. A `Stopping` workload retains
+   its CPU, memory and host-port allocation until the agent acknowledges
+   deletion, preventing a replacement from racing the still-running VM.
+10. If a process exits, the controller terminates the stale workload record and
+    creates a replacement. Stop commands are re-driven after control-plane
+    restarts until acknowledged.
+11. Control-plane shutdown gives HTTP and gRPC up to ten seconds to drain, then
+    force-closes long-lived streams so agents reconnect to a replacement.
 
 ## Apple Silicon runtime choices
 
@@ -100,4 +110,3 @@ The default local-development mode is plaintext. A LAN deployment should use:
 
 Environment variables in this MVP are stored in plaintext. Do not put secrets
 there; a Secret API with encrypted-at-rest values is a follow-up.
-

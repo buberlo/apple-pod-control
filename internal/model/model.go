@@ -1,6 +1,8 @@
 package model
 
 import (
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"net"
 	"regexp"
@@ -137,6 +139,7 @@ type RollingUpdateStrategy struct {
 
 type DeploymentStatus struct {
 	ObservedGeneration  int64       `json:"observedGeneration" yaml:"observedGeneration"`
+	Revision            string      `json:"revision" yaml:"revision"`
 	Replicas            int         `json:"replicas" yaml:"replicas"`
 	UpdatedReplicas     int         `json:"updatedReplicas" yaml:"updatedReplicas"`
 	ReadyReplicas       int         `json:"readyReplicas" yaml:"readyReplicas"`
@@ -173,6 +176,7 @@ type Workload struct {
 	Namespace     string            `json:"namespace"`
 	Deployment    string            `json:"deployment"`
 	Generation    int64             `json:"generation"`
+	Revision      string            `json:"revision"`
 	Replica       int               `json:"replica"`
 	NodeID        string            `json:"nodeId,omitempty"`
 	ContainerName string            `json:"containerName"`
@@ -363,6 +367,14 @@ func validateProbe(name string, probe *Probe) error {
 func (d Deployment) Container() Container { return d.Spec.Template.Spec.Containers[0] }
 
 func (d Deployment) Key() string { return d.Metadata.Namespace + "/" + d.Metadata.Name }
+
+// TemplateRevision is APC's equivalent of the Kubernetes pod-template-hash.
+// Scaling changes Deployment generation but deliberately keeps this revision.
+func (d Deployment) TemplateRevision() string {
+	data, _ := json.Marshal(d.Spec.Template)
+	digest := sha256.Sum256(data)
+	return fmt.Sprintf("%x", digest[:5])
+}
 
 func ParseMemoryBytes(value string) (int64, error) {
 	value = strings.ToUpper(strings.TrimSpace(value))

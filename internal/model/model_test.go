@@ -52,6 +52,22 @@ func TestDeploymentRejectsInvalidMemoryAndRequestsAboveLimits(t *testing.T) {
 	}
 }
 
+func TestTemplateRevisionIgnoresReplicaCount(t *testing.T) {
+	deployment := validDeployment()
+	if err := deployment.DefaultAndValidate(); err != nil {
+		t.Fatal(err)
+	}
+	revision := deployment.TemplateRevision()
+	deployment.Spec.Replicas++
+	if deployment.TemplateRevision() != revision {
+		t.Fatal("replica change altered template revision")
+	}
+	deployment.Spec.Template.Spec.Containers[0].Image = "nginx:new"
+	if deployment.TemplateRevision() == revision {
+		t.Fatal("template change did not alter revision")
+	}
+}
+
 func validDeployment() Deployment {
 	return Deployment{
 		APIVersion: APIVersion, Kind: Kind, Metadata: ObjectMeta{Name: "web"},

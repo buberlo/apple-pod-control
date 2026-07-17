@@ -46,6 +46,12 @@ func (s *AgentService) Connect(stream grpc.BidiStreamingServer[apcv1.AgentMessag
 	if err := s.store.UpsertNode(stream.Context(), node); err != nil {
 		return status.Errorf(codes.Internal, "store node: %v", err)
 	}
+	// The agent keeps its in-memory probe configuration per workload. Re-drive
+	// assigned workloads after every reconnect so a restarted agent adopts the
+	// existing containers and resumes health reporting.
+	if err := s.store.MarkNodeWorkloadsUnknown(stream.Context(), node.ID, "agent reconnected; reconciling workload"); err != nil {
+		return status.Errorf(codes.Internal, "mark node workloads for reconciliation: %v", err)
+	}
 	current, remove := s.sessions.Add(node.ID)
 	defer remove()
 	s.logger.Info("node connected", "node", node.ID, "hostname", node.Hostname, "runtime", node.RuntimeVersion)

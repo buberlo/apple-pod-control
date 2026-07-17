@@ -152,13 +152,22 @@ func (r *AppleContainer) Stop(ctx context.Context, command *apcv1.WorkloadComman
 }
 
 type inspectRecord struct {
-	Status   string `json:"status"`
+	ID       string          `json:"id"`
+	Status   json.RawMessage `json:"status"`
 	Networks []struct {
 		Address string `json:"address"`
 	} `json:"networks"`
 	Configuration struct {
 		ID string `json:"id"`
 	} `json:"configuration"`
+}
+
+type structuredStatus struct {
+	State    string `json:"state"`
+	Networks []struct {
+		IPv4Address string `json:"ipv4Address"`
+		IPv6Address string `json:"ipv6Address"`
+	} `json:"networks"`
 }
 
 func (r *AppleContainer) Observe(ctx context.Context, command *apcv1.WorkloadCommand) (Observation, error) {
@@ -176,12 +185,38 @@ func (r *AppleContainer) Observe(ctx context.Context, command *apcv1.WorkloadCom
 	if len(records) != 1 {
 		return Observation{}, fmt.Errorf("inspect returned %d records", len(records))
 	}
-	state := normalizeState(records[0].Status)
+	statusValue, statusNetworks, err := decodeStatus(records[0].Status)
+	if err != nil {
+		return Observation{}, fmt.Errorf("decode container status: %w", err)
+	}
+	state := normalizeState(statusValue)
 	address := ""
-	if len(records[0].Networks) > 0 {
+	if len(statusNetworks) > 0 {
+		address = strings.Split(statusNetworks[0], "/")[0]
+	} else if len(records[0].Networks) > 0 {
 		address = strings.Split(records[0].Networks[0].Address, "/")[0]
 	}
 	return Observation{State: state, Ready: state == "Running", Address: address}, nil
+}
+
+func decodeStatus(raw json.RawMessage) (string, []string, error) {
+	var legacy string
+	if err := json.Unmarshal(raw, &legacy); err == nil {
+		return legacy, nil, nil
+	}
+	var status structuredStatus
+	if err := json.Unmarshal(raw, &status); err != nil {
+		return "", nil, err
+	}
+	addresses := make([]string, 0, len(status.Networks))
+	for _, network := range status.Networks {
+		if network.IPv4Address != "" {
+			addresses = append(addresses, network.IPv4Address)
+		} else if network.IPv6Address != "" {
+			addresses = append(addresses, network.IPv6Address)
+		}
+	}
+	return status.State, addresses, nil
 }
 
 func (r *AppleContainer) Probe(ctx context.Context, command *apcv1.WorkloadCommand, probe *apcv1.HealthCheck, address string) error {

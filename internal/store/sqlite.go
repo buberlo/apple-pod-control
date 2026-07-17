@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS workloads (
   namespace TEXT NOT NULL,
   deployment TEXT NOT NULL,
   generation INTEGER NOT NULL,
+  revision TEXT NOT NULL,
   replica INTEGER NOT NULL,
   node_id TEXT NOT NULL DEFAULT '',
   container_name TEXT NOT NULL UNIQUE,
@@ -93,6 +94,39 @@ CREATE INDEX IF NOT EXISTS workloads_node_idx ON workloads(node_id, state);
 `
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("migrate sqlite: %w", err)
+	}
+	if err := s.ensureColumn(ctx, "workloads", "revision", `ALTER TABLE workloads ADD COLUMN revision TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) ensureColumn(ctx context.Context, table, column, statement string) error {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return fmt.Errorf("inspect sqlite schema: %w", err)
+	}
+	found := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, dataType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan sqlite schema: %w", err)
+		}
+		if name == column {
+			found = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, statement); err != nil {
+		return fmt.Errorf("add sqlite column %s.%s: %w", table, column, err)
 	}
 	return nil
 }
@@ -284,6 +318,18 @@ func (s *Store) MarkStaleNodes(ctx context.Context, cutoff time.Time) error {
 	return nil
 }
 
+func (s *Store) MarkNodeWorkloadsUnknown(ctx context.Context, nodeID, message string) error {
+	_, err := s.db.ExecContext(ctx, `
+UPDATE workloads
+SET state = 'Unknown', ready = 0, message = ?, updated_at = ?
+WHERE node_id = ? AND state NOT IN ('Stopping', 'Failed')`,
+		message, time.Now().UTC().Format(time.RFC3339Nano), nodeID)
+	if err != nil {
+		return fmt.Errorf("mark node workloads unknown: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) CreateWorkload(ctx context.Context, workload model.Workload) error {
 	now := time.Now().UTC()
 	if workload.CreatedAt.IsZero() {
@@ -295,8 +341,8 @@ func (s *Store) CreateWorkload(ctx context.Context, workload model.Workload) err
 		return fmt.Errorf("encode workload labels: %w", err)
 	}
 	_, err = s.db.ExecContext(ctx, `
-INSERT INTO workloads(id, namespace, deployment, generation, replica, node_id, container_name, labels, state, ready, message, address, restart_count, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, workload.ID, workload.Namespace, workload.Deployment, workload.Generation,
+INSERT INTO workloads(id, namespace, deployment, generation, revision, replica, node_id, container_name, labels, state, ready, message, address, restart_count, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, workload.ID, workload.Namespace, workload.Deployment, workload.Generation, workload.Revision,
 		workload.Replica, workload.NodeID, workload.ContainerName, labels, workload.State, workload.Ready, workload.Message,
 		workload.Address, workload.RestartCount, workload.CreatedAt.Format(time.RFC3339Nano), workload.UpdatedAt.Format(time.RFC3339Nano))
 	if err != nil {
@@ -311,6 +357,10 @@ func (s *Store) AssignWorkload(ctx context.Context, id, nodeID string) error {
 
 func (s *Store) UnassignWorkload(ctx context.Context, id, message string) error {
 	return s.updateWorkload(ctx, id, `node_id = '', state = 'Pending', ready = 0, message = ?`, message)
+}
+
+func (s *Store) BackoffWorkload(ctx context.Context, id, message string) error {
+	return s.updateWorkload(ctx, id, `node_id = '', state = 'Backoff', ready = 0, message = ?`, message)
 }
 
 func (s *Store) UpdateWorkloadObservation(ctx context.Context, id, state string, ready bool, message, address string, restartCount int) error {
@@ -344,7 +394,7 @@ func (s *Store) DeleteWorkload(ctx context.Context, id string) error {
 
 func (s *Store) ListWorkloads(ctx context.Context) ([]model.Workload, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, namespace, deployment, generation, replica, node_id, container_name, labels, state, ready, message, address, restart_count, created_at, updated_at
+SELECT id, namespace, deployment, generation, revision, replica, node_id, container_name, labels, state, ready, message, address, restart_count, created_at, updated_at
 FROM workloads ORDER BY namespace, deployment, generation, replica`)
 	if err != nil {
 		return nil, fmt.Errorf("list workloads: %w", err)
@@ -355,7 +405,7 @@ FROM workloads ORDER BY namespace, deployment, generation, replica`)
 		var workload model.Workload
 		var labels []byte
 		var createdAt, updatedAt string
-		if err := rows.Scan(&workload.ID, &workload.Namespace, &workload.Deployment, &workload.Generation, &workload.Replica,
+		if err := rows.Scan(&workload.ID, &workload.Namespace, &workload.Deployment, &workload.Generation, &workload.Revision, &workload.Replica,
 			&workload.NodeID, &workload.ContainerName, &labels, &workload.State, &workload.Ready, &workload.Message,
 			&workload.Address, &workload.RestartCount, &createdAt, &updatedAt); err != nil {
 			return nil, fmt.Errorf("scan workload: %w", err)

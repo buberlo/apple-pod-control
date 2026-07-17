@@ -44,6 +44,19 @@ func TestObserveParsesAppleContainerInspect(t *testing.T) {
 	}
 }
 
+func TestObserveParsesAppleContainerOneDotZeroInspect(t *testing.T) {
+	runner := &stubRunner{stdout: []byte(`[{"id":"web","configuration":{"id":"web"},"status":{"state":"running","networks":[{"ipv4Address":"192.168.64.47/24","ipv6Address":"fd00::1/64"}]}}]`)}
+	runtime := NewAppleContainer("container")
+	runtime.runner = runner
+	observation, err := runtime.Observe(context.Background(), &apcv1.WorkloadCommand{ContainerName: "web"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observation.State != "Running" || !observation.Ready || observation.Address != "192.168.64.47" {
+		t.Fatalf("unexpected observation: %#v", observation)
+	}
+}
+
 type stubRunner struct {
 	stdout []byte
 	stderr []byte

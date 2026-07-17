@@ -106,7 +106,20 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = httpServer.Shutdown(shutdownCtx)
-	grpcServer.GracefulStop()
+	grpcStopped := make(chan struct{})
+	go func() {
+		grpcServer.GracefulStop()
+		close(grpcStopped)
+	}()
+	select {
+	case <-grpcStopped:
+	case <-shutdownCtx.Done():
+		// Long-lived agent streams do not end merely because GracefulStop sent
+		// GOAWAY. Force-close them after the deadline so agents can reconnect to
+		// a replacement control plane instead of pinning the old process forever.
+		grpcServer.Stop()
+		<-grpcStopped
+	}
 }
 
 func serverTLSConfig(certificateFile, keyFile, clientCAFile string) (*tls.Config, error) {

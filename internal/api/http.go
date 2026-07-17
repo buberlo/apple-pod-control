@@ -191,13 +191,13 @@ func (s *Server) deleteDeployment(writer http.ResponseWriter, request *http.Requ
 }
 
 func deploymentStatus(deployment model.Deployment, workloads []model.Workload) model.DeploymentStatus {
-	status := model.DeploymentStatus{ObservedGeneration: deployment.Metadata.Generation}
+	status := model.DeploymentStatus{ObservedGeneration: deployment.Metadata.Generation, Revision: deployment.TemplateRevision()}
 	for _, workload := range workloads {
 		if workload.Namespace != deployment.Metadata.Namespace || workload.Deployment != deployment.Metadata.Name || workload.State == "Stopping" {
 			continue
 		}
 		status.Replicas++
-		if workload.Generation == deployment.Metadata.Generation {
+		if workload.Revision == deployment.TemplateRevision() {
 			status.UpdatedReplicas++
 		}
 		if workload.Ready {

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -73,6 +72,12 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 
 	for index := range workloads {
 		workload := workloads[index]
+		if workload.State == "Stopping" {
+			if err := r.retire(ctx, workload); err != nil {
+				return err
+			}
+			continue
+		}
 		_, desired := byKey[workload.Namespace+"/"+workload.Deployment]
 		if !desired || workload.State == "Failed" {
 			if err := r.retire(ctx, workload); err != nil {
@@ -104,7 +109,7 @@ func (r *Reconciler) reconcileDeployment(ctx context.Context, deployment model.D
 		if workload.Namespace != deployment.Metadata.Namespace || workload.Deployment != deployment.Metadata.Name || workload.State == "Stopping" {
 			continue
 		}
-		if workload.Generation == deployment.Metadata.Generation {
+		if workload.Revision == deployment.TemplateRevision() {
 			current = append(current, workload)
 		} else {
 			old = append(old, workload)
@@ -184,20 +189,25 @@ func (r *Reconciler) retire(ctx context.Context, workload model.Workload) error 
 }
 
 func (r *Reconciler) schedule(ctx context.Context, deployments map[string]model.Deployment, nodes []model.Node, workloads []model.Workload) error {
+	const retryBackoff = 10 * time.Second
 	allocation := buildAllocation(deployments, workloads)
 	for index := range workloads {
 		workload := workloads[index]
 		deployment, exists := deployments[workload.Namespace+"/"+workload.Deployment]
-		if !exists || workload.Generation != deployment.Metadata.Generation || workload.State == "Stopping" {
+		if !exists || workload.Revision != deployment.TemplateRevision() || workload.State == "Stopping" {
 			continue
 		}
-		if workload.State == "Assigned" || (workload.State == "Starting" && time.Since(workload.UpdatedAt) > 15*time.Second) {
+		shouldRecover := workload.State == "Unknown" || (workload.State == "Pending" && workload.NodeID != "")
+		if workload.State == "Assigned" || shouldRecover || (workload.State == "Starting" && time.Since(workload.UpdatedAt) > 15*time.Second) {
 			if r.sessions.Connected(workload.NodeID) {
 				r.sessions.Dispatch(workload.NodeID, startCommand(deployment, workload))
 			}
 			continue
 		}
-		if workload.State != "Pending" || workload.NodeID != "" {
+		if workload.State == "Backoff" && time.Since(workload.UpdatedAt) < retryBackoff {
+			continue
+		}
+		if (workload.State != "Pending" && workload.State != "Backoff") || workload.NodeID != "" {
 			continue
 		}
 		node := selectNode(deployment, nodes, workloads, deployments, allocation, r.sessions)
@@ -221,7 +231,7 @@ func (r *Reconciler) schedule(ctx context.Context, deployments map[string]model.
 func (r *Reconciler) HandleAck(ctx context.Context, command *apcv1.WorkloadCommand, errorText string) error {
 	if errorText != "" {
 		if command.Operation == apcv1.CommandOperation_COMMAND_OPERATION_START {
-			return r.store.UnassignWorkload(ctx, command.WorkloadId, "start failed: "+errorText)
+			return r.store.BackoffWorkload(ctx, command.WorkloadId, "BackOff after start failure: "+errorText)
 		}
 		return r.store.SetWorkloadState(ctx, command.WorkloadId, "Failed", "stop failed: "+errorText)
 	}
@@ -244,8 +254,8 @@ func newWorkload(deployment model.Deployment, replica int) model.Workload {
 	suffix := strings.ReplaceAll(id[:8], "-", "")
 	return model.Workload{
 		ID: id, Namespace: deployment.Metadata.Namespace, Deployment: deployment.Metadata.Name,
-		Generation: deployment.Metadata.Generation, Replica: replica,
-		ContainerName: fmt.Sprintf("%s-%s-%s", deployment.Metadata.Name, strconv.FormatInt(deployment.Metadata.Generation, 36), suffix),
+		Generation: deployment.Metadata.Generation, Revision: deployment.TemplateRevision(), Replica: replica,
+		ContainerName: fmt.Sprintf("%s-%s-%s", deployment.Metadata.Name, deployment.TemplateRevision()[:5], suffix),
 		Labels:        deployment.Spec.Template.Metadata.Labels, State: "Pending",
 	}
 }
@@ -297,7 +307,7 @@ type resourceAllocation struct {
 func buildAllocation(deployments map[string]model.Deployment, workloads []model.Workload) map[string]resourceAllocation {
 	result := make(map[string]resourceAllocation)
 	for _, workload := range workloads {
-		if workload.NodeID == "" || workload.State == "Stopping" {
+		if workload.NodeID == "" {
 			continue
 		}
 		deployment, exists := deployments[workload.Namespace+"/"+workload.Deployment]
@@ -349,7 +359,9 @@ func hostPortConflict(nodeID string, desired model.Deployment, workloads []model
 		return false
 	}
 	for _, workload := range workloads {
-		if workload.NodeID != nodeID || workload.State == "Stopping" {
+		// Stopping workloads still own their host resources until the agent's
+		// stop/delete acknowledgement removes the workload record.
+		if workload.NodeID != nodeID {
 			continue
 		}
 		existing, found := deployments[workload.Namespace+"/"+workload.Deployment]
