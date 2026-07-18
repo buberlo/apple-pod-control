@@ -26,8 +26,8 @@ brew install kubernetes-cli helm
 bin/apc cluster create spike
 export KUBECONFIG="$(bin/apc kubeconfig path spike)"
 
-kubectl get nodes -o wide
-kubectl get pods -A
+bin/apc get nodes -o wide
+bin/apc get pods -A
 ```
 
 The default image is pinned by OCI digest. The API listens on port `16443`
@@ -36,7 +36,9 @@ the internal and published ports equal is required because K3s advertises that
 port to its remotedialer clients.
 
 The create operation is idempotent. If the labelled node already exists, APC
-adopts or starts it and refreshes the kubeconfig.
+adopts or starts it and refreshes the kubeconfig. Successful create/start also
+selects the cluster as the active APC context, so subsequent Kubernetes
+workload commands use the short `apc get/apply/logs/exec/...` form.
 
 ## Install the example web server with Helm
 
@@ -44,13 +46,13 @@ adopts or starts it and refreshes the kubeconfig.
 helm lint examples/helm/web
 helm upgrade --install web examples/helm/web --wait --timeout 2m
 helm list
-kubectl get deployment,pod,service -o wide
+bin/apc get deployment,pod,service -o wide
 ```
 
 Expose it temporarily to the Mac:
 
 ```bash
-kubectl port-forward service/web-apc-web 18081:80
+bin/apc port-forward service/web-apc-web 18081:80
 curl http://127.0.0.1:18081/
 ```
 
@@ -67,6 +69,11 @@ bin/apc cluster start spike
 
 # Bootstrap convenience when host kubectl is not installed:
 bin/apc kubectl spike -- get pods -A
+
+# Context management:
+bin/apc config get-clusters
+bin/apc config use-cluster spike
+bin/apc config current-cluster
 ```
 
 `cluster stop` stops the disposable VM envelope. `cluster start` deletes the
@@ -128,12 +135,13 @@ Then validate from the server Mac:
 
 ```bash
 export KUBECONFIG="$(bin/apc kubeconfig path lan-spike)"
-kubectl get nodes -o wide
+bin/apc config use-cluster lan-spike
+bin/apc get nodes -o wide
 helm upgrade --install web examples/helm/web \
   --set replicaCount=2 \
   --set topologySpread.whenUnsatisfiable=DoNotSchedule \
   --wait --timeout 2m
-kubectl get pods -o wide
+bin/apc get pods -o wide
 ```
 
 The current spike uses unencrypted Flannel VXLAN and must remain on a trusted
@@ -142,3 +150,8 @@ recover correctly when Apple container assigned a new private VM address;
 Kubernetes `NetworkPolicy` is therefore not enforced in this phase. See the
 [validation report](k3s-spike-results.md) for the complete acceptance matrix
 and remaining work.
+
+When an APC v2 context is active, overlapping commands target Kubernetes. Use
+`bin/apc --legacy get pods` to explicitly address the APC v1 REST control plane.
+The complete routing and compatibility contract is documented in
+[cli-v2.md](cli-v2.md).

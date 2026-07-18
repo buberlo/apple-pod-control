@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -32,7 +33,10 @@ const (
 	dynamicNodeIPScript = `NODE_IP=$(hostname -i); NODE_IP=${NODE_IP%% *}; exec /bin/k3s "$@" --node-ip "$NODE_IP"`
 )
 
-var ErrNotFound = errors.New("cluster not found")
+var (
+	ErrNotFound         = errors.New("cluster not found")
+	ErrNoCurrentCluster = errors.New("no current APC cluster")
+)
 
 var dnsLabel = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 
@@ -159,6 +163,9 @@ func (m *Manager) Create(ctx context.Context, config Config) (State, error) {
 		return State{}, err
 	}
 	if err := saveClusterConfig(config); err != nil {
+		return State{}, err
+	}
+	if err := SetCurrentCluster(config.Name); err != nil {
 		return State{}, err
 	}
 	state, err := m.Status(ctx, config.Name)
@@ -365,7 +372,14 @@ func (m *Manager) Start(ctx context.Context, name string, timeout time.Duration)
 	if err := m.waitReady(ctx, ContainerName(name), config.NodeName, timeout); err != nil {
 		return State{}, err
 	}
-	return m.Status(ctx, name)
+	state, err := m.Status(ctx, name)
+	if err != nil {
+		return State{}, err
+	}
+	if err := SetCurrentCluster(name); err != nil {
+		return State{}, err
+	}
+	return state, nil
 }
 
 func (m *Manager) WriteAgentToken(ctx context.Context, name, path string) (string, error) {
@@ -427,6 +441,97 @@ func KubeconfigPath(clusterName string) (string, error) {
 	return filepath.Join(configDirectory, "apc", "clusters", clusterName, "kubeconfig"), nil
 }
 
+func ResolvedKubeconfigPath(clusterName string) (string, error) {
+	if !dnsLabel.MatchString(clusterName) {
+		return "", fmt.Errorf("cluster name must be a lowercase DNS label")
+	}
+	config, err := loadClusterConfig(clusterName)
+	if err == nil {
+		return config.KubeconfigPath, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	return KubeconfigPath(clusterName)
+}
+
+func SetCurrentCluster(clusterName string) error {
+	if !dnsLabel.MatchString(clusterName) {
+		return fmt.Errorf("cluster name must be a lowercase DNS label")
+	}
+	kubeconfig, err := ResolvedKubeconfigPath(clusterName)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(kubeconfig)
+	if err != nil {
+		return fmt.Errorf("read kubeconfig for cluster %q: %w", clusterName, err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("kubeconfig for cluster %q is not a regular file", clusterName)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("kubeconfig for cluster %q must have mode 0600 or stricter", clusterName)
+	}
+	path, err := currentClusterPath()
+	if err != nil {
+		return err
+	}
+	if err := writePrivateFile(path, []byte(clusterName+"\n")); err != nil {
+		return fmt.Errorf("save current cluster: %w", err)
+	}
+	return nil
+}
+
+func CurrentCluster() (string, error) {
+	path, err := currentClusterPath()
+	if err != nil {
+		return "", err
+	}
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", ErrNoCurrentCluster
+	}
+	if err != nil {
+		return "", fmt.Errorf("read current cluster: %w", err)
+	}
+	name := strings.TrimSpace(string(data))
+	if !dnsLabel.MatchString(name) {
+		return "", fmt.Errorf("current cluster file contains an invalid name")
+	}
+	return name, nil
+}
+
+func ListClusters() ([]string, error) {
+	configDirectory, err := os.UserConfigDir()
+	if err != nil {
+		return nil, fmt.Errorf("resolve user configuration directory: %w", err)
+	}
+	root := filepath.Join(configDirectory, "apc", "clusters")
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return []string{}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("list APC clusters: %w", err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() || !dnsLabel.MatchString(entry.Name()) {
+			continue
+		}
+		path, pathErr := ResolvedKubeconfigPath(entry.Name())
+		if pathErr != nil {
+			continue
+		}
+		if info, statErr := os.Stat(path); statErr == nil && info.Mode().IsRegular() {
+			names = append(names, entry.Name())
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
 func AgentTokenPath(clusterName string) (string, error) {
 	configDirectory, err := os.UserConfigDir()
 	if err != nil {
@@ -441,6 +546,14 @@ func clusterConfigPath(clusterName string) (string, error) {
 		return "", fmt.Errorf("resolve user configuration directory: %w", err)
 	}
 	return filepath.Join(configDirectory, "apc", "clusters", clusterName, "cluster.json"), nil
+}
+
+func currentClusterPath() (string, error) {
+	configDirectory, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve user configuration directory: %w", err)
+	}
+	return filepath.Join(configDirectory, "apc", "current-cluster"), nil
 }
 
 func ServerRunArguments(config Config) []string {
@@ -853,16 +966,16 @@ func replaceScalar(node *yaml.Node, key, value string) bool {
 func writePrivateFile(path string, data []byte) error {
 	directory := filepath.Dir(path)
 	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return fmt.Errorf("create kubeconfig directory: %w", err)
+		return fmt.Errorf("create private file directory: %w", err)
 	}
 	if err := os.Chmod(directory, 0o700); err != nil {
-		return fmt.Errorf("secure kubeconfig directory: %w", err)
+		return fmt.Errorf("secure private file directory: %w", err)
 	}
 	if err := os.WriteFile(path, data, 0o600); err != nil {
-		return fmt.Errorf("write kubeconfig: %w", err)
+		return fmt.Errorf("write private file: %w", err)
 	}
 	if err := os.Chmod(path, 0o600); err != nil {
-		return fmt.Errorf("secure kubeconfig: %w", err)
+		return fmt.Errorf("secure private file: %w", err)
 	}
 	return nil
 }

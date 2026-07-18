@@ -29,7 +29,7 @@ failure behavior are documented in [docs/architecture.md](docs/architecture.md).
 - `apc`, a kubectl-like CLI:
 
 ```text
-apc apply -f deployment.yaml
+apc apply -f examples/deployment.yaml
 apc get deployments
 apc get pods -o wide
 apc get nodes
@@ -38,6 +38,24 @@ apc scale deployment web --replicas=3
 apc rollout status deployment/web --timeout=2m
 apc delete deployment web
 ```
+
+Those commands target the APC v1 API when no APC v2 context exists or when
+`--legacy` is used. With an active K3s cluster, APC v2 forwards Kubernetes
+workload commands to native `kubectl` with full streaming and flag support:
+
+```text
+apc config use-cluster lan-spike
+apc get pods -A -o wide
+apc apply -f examples/kubernetes/web.yaml
+apc logs -f deployment/web
+apc exec -it deployment/web -- /bin/sh
+apc rollout status deployment/web
+apc port-forward service/web 8081:80
+```
+
+APC owns cluster lifecycle and context selection. Kubernetes continues to own
+its API and command semantics; Helm uses the same generated kubeconfig. See the
+[APC v2 CLI contract](docs/cli-v2.md).
 
 ## Requirements
 
@@ -72,9 +90,10 @@ bin/apc doctor
 bin/apc cluster create spike
 export KUBECONFIG="$(bin/apc kubeconfig path spike)"
 
-kubectl get nodes
+bin/apc get nodes
+bin/apc get pods -A
 helm upgrade --install web examples/helm/web --wait
-kubectl port-forward service/web-apc-web 18081:80
+bin/apc port-forward service/web-apc-web 18081:80
 ```
 
 The K3s version and multi-platform OCI image digest are pinned in code. The

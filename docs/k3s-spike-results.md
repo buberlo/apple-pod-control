@@ -1,6 +1,6 @@
 # K3s on Apple container 1.0: two-Mac spike results
 
-Date: 2026-07-17
+Initial run: 2026-07-17. CLI/context follow-up and network recheck: 2026-07-18.
 
 The spike ran a pinned, native ARM64 K3s server in an Apple container VM on a
 MacBook and a K3s agent in a second Apple container VM on a Mac mini. APC v1
@@ -14,6 +14,7 @@ intentionally omitted.
 | Required preflight on both Apple Silicon Macs | Pass | Darwin/arm64, Apple container 1.0, service, capabilities and required ports |
 | K3s server, SQLite, scheduler, containerd and kubelet | Pass | Server node reached Kubernetes `Ready` |
 | Native `kubectl` and Helm | Pass | Host clients reached the generated kubeconfig; chart install completed |
+| kubectl-compatible `apc` frontend | Pass | `get`, server-side dry-run `apply`, `logs`, `exec`, `auth can-i` and `cluster-info` ran against K3s |
 | Second physical node | Pass | Mac mini agent joined and reached `Ready` |
 | Scheduler placement across hosts | Pass | Two nginx replicas, one on each physical Mac |
 | Bidirectional cross-host Pod HTTP | Pass before restart test | Pods in different Flannel subnets reached each other in both directions |
@@ -38,6 +39,10 @@ intentionally omitted.
   an `InternalIP` change. NetworkPolicy enforcement is not available yet.
 - Flannel VXLAN works across the two Macs while VM-to-LAN routing is healthy.
   Its traffic is unencrypted and suitable only for a trusted lab network.
+- The bidirectional cross-host Pod probe was repeated on 2026-07-18 and still
+  timed out in both directions. Both Kubernetes nodes and local Pods remained
+  `Ready`, confirming that readiness alone cannot detect this host-runtime
+  routing failure; a deep cluster doctor remains necessary.
 
 ## Remaining gates for a usable alpha
 
@@ -53,7 +58,7 @@ intentionally omitted.
    Kubernetes NetworkPolicy semantics.
 6. Add cluster deletion, upgrades, backup/restore and three-server embedded-etcd
    HA. A two-node server/agent cluster is not control-plane HA.
-7. Make APC v2's workload command path a thin kubectl-compatible frontend while
-   keeping native `kubectl` and Helm as first-class clients. APC should own
-   Apple-specific lifecycle, diagnostics and image transport—not reimplement
-   Kubernetes APIs.
+
+The kubectl-compatible APC frontend is now implemented. Additional Kubernetes
+verbs inherit their behavior from the installed native `kubectl`; APC does not
+translate or reimplement those APIs.

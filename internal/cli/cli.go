@@ -22,7 +22,7 @@ import (
 	"github.com/buberlo/apple-pod-control/internal/model"
 )
 
-const Version = "v0.1.0"
+const Version = "v0.2.0-alpha.1"
 
 type options struct {
 	server             string
@@ -31,6 +31,8 @@ type options struct {
 	caFile             string
 	insecureSkipVerify bool
 	requestTimeout     time.Duration
+	cluster            string
+	legacy             bool
 	out                io.Writer
 	errOut             io.Writer
 }
@@ -53,10 +55,12 @@ func NewCommand(out, errOut io.Writer) *cobra.Command {
 	command.PersistentFlags().StringVar(&options.caFile, "certificate-authority", "", "CA certificate for the API server")
 	command.PersistentFlags().BoolVar(&options.insecureSkipVerify, "insecure-skip-tls-verify", false, "skip TLS certificate validation")
 	command.PersistentFlags().DurationVar(&options.requestTimeout, "request-timeout", 30*time.Second, "request timeout")
+	command.PersistentFlags().StringVar(&options.cluster, "cluster", "", "APC v2 cluster (or APC_CLUSTER)")
+	command.PersistentFlags().BoolVar(&options.legacy, "legacy", false, "use the APC v1 control-plane API")
 	command.AddCommand(
 		options.applyCommand(), options.getCommand(), options.describeCommand(), options.deleteCommand(),
 		options.rolloutCommand(), options.scaleCommand(), options.versionCommand(), options.doctorCommand(),
-		options.clusterCommand(), options.nodeCommand(), options.kubeconfigCommand(), options.kubectlCommand(),
+		options.clusterCommand(), options.nodeCommand(), options.configCommand(), options.kubeconfigCommand(), options.kubectlCommand(),
 	)
 	return command
 }
@@ -150,7 +154,7 @@ func (o *options) clusterStatusCommand() *cobra.Command {
 		Short: "Show the K3s server and Kubernetes node state",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(command *cobra.Command, args []string) error {
-			name := clusterName(args)
+			name := o.clusterName(args)
 			state, err := cluster.NewManager("container").Status(command.Context(), name)
 			if err != nil {
 				return err
@@ -178,7 +182,7 @@ func (o *options) clusterStartCommand() *cobra.Command {
 		Short: "Start a stopped APC K3s node",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(command *cobra.Command, args []string) error {
-			state, err := cluster.NewManager("container").Start(command.Context(), clusterName(args), timeout)
+			state, err := cluster.NewManager("container").Start(command.Context(), o.clusterName(args), timeout)
 			if err != nil {
 				return err
 			}
@@ -196,7 +200,7 @@ func (o *options) clusterStopCommand() *cobra.Command {
 		Short: "Stop an APC K3s node without deleting its state",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(command *cobra.Command, args []string) error {
-			name := clusterName(args)
+			name := o.clusterName(args)
 			if err := cluster.NewManager("container").Stop(command.Context(), name); err != nil {
 				return err
 			}
@@ -213,7 +217,7 @@ func (o *options) clusterWriteJoinTokenCommand() *cobra.Command {
 		Short: "Write a K3s agent token to a protected file",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(command *cobra.Command, args []string) error {
-			name := clusterName(args)
+			name := o.clusterName(args)
 			path, err := cluster.NewManager("container").WriteAgentToken(command.Context(), name, outputPath)
 			if err != nil {
 				return err
@@ -239,7 +243,7 @@ func (o *options) nodeJoinCommand() *cobra.Command {
 		Short: "Join this Mac to an APC K3s cluster",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(command *cobra.Command, args []string) error {
-			config.Name = clusterName(args)
+			config.Name = o.clusterName(args)
 			state, err := cluster.NewManager("container").Join(command.Context(), config)
 			if err != nil {
 				return err
@@ -268,7 +272,7 @@ func (o *options) nodeStatusCommand() *cobra.Command {
 		Short: "Show this Mac's K3s agent VM state",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(command *cobra.Command, args []string) error {
-			state, err := cluster.NewManager("container").AgentStatus(command.Context(), clusterName(args))
+			state, err := cluster.NewManager("container").AgentStatus(command.Context(), o.clusterName(args))
 			if err != nil {
 				return err
 			}
@@ -287,7 +291,7 @@ func (o *options) kubeconfigCommand() *cobra.Command {
 		Short: "Print the kubeconfig path",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			path, err := cluster.KubeconfigPath(clusterName(args))
+			path, err := cluster.ResolvedKubeconfigPath(o.clusterName(args))
 			if err != nil {
 				return err
 			}
@@ -295,6 +299,60 @@ func (o *options) kubeconfigCommand() *cobra.Command {
 			return err
 		},
 	})
+	return command
+}
+
+func (o *options) configCommand() *cobra.Command {
+	command := &cobra.Command{Use: "config", Short: "Manage the active APC v2 cluster context"}
+	command.AddCommand(
+		&cobra.Command{
+			Use:   "use-cluster NAME",
+			Short: "Select the cluster used by kubectl-compatible APC commands",
+			Args:  cobra.ExactArgs(1),
+			RunE: func(_ *cobra.Command, args []string) error {
+				if err := cluster.SetCurrentCluster(args[0]); err != nil {
+					return err
+				}
+				fmt.Fprintf(o.out, "Switched to APC cluster %q.\n", args[0])
+				return nil
+			},
+		},
+		&cobra.Command{
+			Use:   "current-cluster",
+			Short: "Print the active APC v2 cluster",
+			Args:  cobra.NoArgs,
+			RunE: func(_ *cobra.Command, _ []string) error {
+				name, err := cluster.CurrentCluster()
+				if err != nil {
+					return err
+				}
+				_, err = fmt.Fprintln(o.out, name)
+				return err
+			},
+		},
+		&cobra.Command{
+			Use:   "get-clusters",
+			Short: "List clusters with locally managed kubeconfigs",
+			Args:  cobra.NoArgs,
+			RunE: func(_ *cobra.Command, _ []string) error {
+				names, err := cluster.ListClusters()
+				if err != nil {
+					return err
+				}
+				current, _ := cluster.CurrentCluster()
+				writer := tabwriter.NewWriter(o.out, 0, 4, 2, ' ', 0)
+				fmt.Fprintln(writer, "CURRENT\tNAME")
+				for _, name := range names {
+					marker := ""
+					if name == current {
+						marker = "*"
+					}
+					fmt.Fprintf(writer, "%s\t%s\n", marker, name)
+				}
+				return writer.Flush()
+			},
+		},
+	)
 	return command
 }
 
@@ -328,12 +386,18 @@ func (o *options) kubectlCommand() *cobra.Command {
 	}
 }
 
-func clusterName(args []string) string {
+func (o *options) clusterName(args []string) string {
 	if len(args) > 0 && args[0] != "" {
 		return args[0]
 	}
+	if o.cluster != "" {
+		return o.cluster
+	}
 	if value := os.Getenv("APC_CLUSTER"); value != "" {
 		return value
+	}
+	if current, err := cluster.CurrentCluster(); err == nil {
+		return current
 	}
 	return "spike"
 }

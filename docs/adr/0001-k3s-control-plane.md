@@ -42,6 +42,13 @@ Helm operate on the generated kubeconfig. The temporary `apc kubectl` command
 uses K3s's bundled client as a bootstrap convenience, not as a replacement for
 native Kubernetes tooling.
 
+For workload operations, an active APC context makes kubectl-compatible top
+level commands such as `apc get`, `apc apply`, `apc logs` and `apc exec` launch
+the native kubectl process with the APC-managed kubeconfig and inherited
+standard I/O. This preserves watches, interactive terminals, plugins, exit
+behavior and future Kubernetes flags. `--legacy` explicitly retains access to
+the APC v1 REST API; APC does not build a second Kubernetes command parser.
+
 ## Verified on Apple container 1.0
 
 The following was exercised on an Apple Silicon MacBook with

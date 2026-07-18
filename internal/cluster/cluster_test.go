@@ -190,6 +190,40 @@ func TestStatusSelectsNodeMatchingServerVMAddress(t *testing.T) {
 	}
 }
 
+func TestCurrentClusterRoundTripAndListing(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
+
+	for _, name := range []string{"zeta", "alpha"} {
+		path, err := KubeconfigPath(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("apiVersion: v1\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := SetCurrentCluster("zeta"); err != nil {
+		t.Fatal(err)
+	}
+	current, err := CurrentCluster()
+	if err != nil || current != "zeta" {
+		t.Fatalf("current = %q, err = %v", current, err)
+	}
+	clusters, err := ListClusters()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(clusters, []string{"alpha", "zeta"}) {
+		t.Fatalf("clusters = %#v", clusters)
+	}
+}
+
 func contains(values []string, value string) bool {
 	for _, candidate := range values {
 		if candidate == value {
