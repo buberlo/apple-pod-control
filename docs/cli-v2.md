@@ -69,6 +69,34 @@ helm upgrade --install web examples/helm/web --wait
 fallback when native kubectl has not yet been installed. Direct v2 workload
 commands intentionally require native kubectl.
 
+## Deep cluster diagnostics
+
+Kubernetes Node readiness does not prove that Apple VM NAT or cross-host VXLAN
+still works. APC therefore provides an end-to-end diagnostic gate:
+
+```bash
+apc cluster doctor
+apc cluster doctor lan-spike --output json
+apc cluster doctor --skip-egress
+```
+
+The doctor creates uniquely named `apc-doctor-*` resources in the `default`
+namespace and pins one `nginx:alpine` probe Pod to every Ready node. It verifies:
+
+- the Apple server VM, published API port and Kubernetes Node conditions;
+- Pod creation and kubelet exec on every node;
+- CoreDNS and public HTTPS egress from every node;
+- HTTP between every directed pair of nodes, exercising the real VXLAN path;
+- Service DNS and ClusterIP routing from every node to a deterministic probe
+  endpoint.
+
+The exact probe Pods and Service are force-deleted even when checks fail or the
+main diagnostic context times out. APC deliberately does not create a temporary
+namespace: namespace finalization can itself block when an aggregated API such
+as Metrics Server is unreachable. `--keep` retains the listed resources for
+manual inspection; the operator must then delete them. The doctor exits nonzero
+when a required check fails, making it suitable as an alpha acceptance gate.
+
 ## APC v1 compatibility
 
 If no current v2 cluster exists, overlapping commands retain their APC v1

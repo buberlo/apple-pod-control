@@ -105,8 +105,46 @@ func (o *options) doctorCommand() *cobra.Command {
 func (o *options) clusterCommand() *cobra.Command {
 	command := &cobra.Command{Use: "cluster", Short: "Manage Kubernetes clusters hosted by apple/container"}
 	command.AddCommand(
-		o.clusterCreateCommand(), o.clusterStatusCommand(), o.clusterStartCommand(), o.clusterStopCommand(), o.clusterWriteJoinTokenCommand(),
+		o.clusterCreateCommand(), o.clusterStatusCommand(), o.clusterDoctorCommand(), o.clusterStartCommand(), o.clusterStopCommand(), o.clusterWriteJoinTokenCommand(),
 	)
+	return command
+}
+
+func (o *options) clusterDoctorCommand() *cobra.Command {
+	config := cluster.DiagnoseOptions{}
+	var outputFormat string
+	command := &cobra.Command{
+		Use:   "doctor [NAME]",
+		Short: "Run end-to-end Kubernetes and cross-node network diagnostics",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(command *cobra.Command, args []string) error {
+			report, err := cluster.NewManager("container").Diagnose(command.Context(), o.clusterName(args), config)
+			if err != nil {
+				return err
+			}
+			switch outputFormat {
+			case "", "text":
+				err = report.WriteText(o.out)
+			case "json", "yaml":
+				err = printObject(o.out, report, outputFormat)
+			default:
+				return fmt.Errorf("unsupported output format %q; use text, json, or yaml", outputFormat)
+			}
+			if err != nil {
+				return err
+			}
+			if report.FailureCount() > 0 {
+				return fmt.Errorf("%d cluster checks failed", report.FailureCount())
+			}
+			return nil
+		},
+	}
+	command.Flags().StringVar(&config.Image, "image", "docker.io/library/nginx:alpine", "diagnostic Pod image")
+	command.Flags().DurationVar(&config.Timeout, "timeout", 2*time.Minute, "overall diagnostic timeout")
+	command.Flags().DurationVar(&config.ProbeTimeout, "probe-timeout", 8*time.Second, "timeout for each network probe")
+	command.Flags().BoolVar(&config.Keep, "keep", false, "retain the diagnostic namespace for inspection")
+	command.Flags().BoolVar(&config.SkipEgress, "skip-egress", false, "skip public HTTPS egress probes")
+	command.Flags().StringVarP(&outputFormat, "output", "o", "text", "output format: text, json, or yaml")
 	return command
 }
 

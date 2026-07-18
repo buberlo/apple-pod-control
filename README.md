@@ -51,11 +51,17 @@ apc logs -f deployment/web
 apc exec -it deployment/web -- /bin/sh
 apc rollout status deployment/web
 apc port-forward service/web 8081:80
+apc cluster doctor
 ```
 
 APC owns cluster lifecycle and context selection. Kubernetes continues to own
 its API and command semantics; Helm uses the same generated kubeconfig. See the
 [APC v2 CLI contract](docs/cli-v2.md).
+
+`apc cluster doctor` goes beyond Kubernetes `Ready`: it creates an isolated,
+short-lived probe Pod on every Ready node and checks host API reachability,
+kubelet exec, DNS, HTTPS egress, ClusterIP and directed cross-node HTTP. The
+uniquely named probe Pods and Service are deleted automatically.
 
 ## Requirements
 

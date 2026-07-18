@@ -15,6 +15,7 @@ intentionally omitted.
 | K3s server, SQLite, scheduler, containerd and kubelet | Pass | Server node reached Kubernetes `Ready` |
 | Native `kubectl` and Helm | Pass | Host clients reached the generated kubeconfig; chart install completed |
 | kubectl-compatible `apc` frontend | Pass | `get`, server-side dry-run `apply`, `logs`, `exec`, `auth can-i` and `cluster-info` ran against K3s |
+| Deep `apc cluster doctor` | Pass as a diagnostic | Created one Pod per node, found the known network failures, and verified exact-resource cleanup |
 | Second physical node | Pass | Mac mini agent joined and reached `Ready` |
 | Scheduler placement across hosts | Pass | Two nginx replicas, one on each physical Mac |
 | Bidirectional cross-host Pod HTTP | Pass before restart test | Pods in different Flannel subnets reached each other in both directions |
@@ -46,19 +47,45 @@ intentionally omitted.
 
 ## Remaining gates for a usable alpha
 
-1. Add `apc cluster doctor` with guest egress, API, kubelet and bidirectional
-   UDP 8472 probes so a host-runtime failure is detected before scheduling.
-2. Add `apc image prefetch/sync` for deterministic or air-gapped recovery when
+1. Add `apc image prefetch/sync` for deterministic or air-gapped recovery when
    a node cannot pull OCI layers.
-3. Repeat automated cold-start and simultaneous-restart tests after restoring
+2. Repeat automated cold-start and simultaneous-restart tests after restoring
    the affected Mac's Apple-VM networking; run them in CI on two real Macs.
-4. Add host firewall management and a secure host overlay before leaving a
+3. Add host firewall management and a secure host overlay before leaving a
    trusted LAN. Do not expose VXLAN directly to an untrusted network.
-5. Select a restart-safe CNI/network-policy implementation and re-enable
+4. Select a restart-safe CNI/network-policy implementation and re-enable
    Kubernetes NetworkPolicy semantics.
-6. Add cluster deletion, upgrades, backup/restore and three-server embedded-etcd
+5. Add cluster deletion, upgrades, backup/restore and three-server embedded-etcd
    HA. A two-node server/agent cluster is not control-plane HA.
 
 The kubectl-compatible APC frontend is now implemented. Additional Kubernetes
 verbs inherit their behavior from the installed native `kubectl`; APC does not
 translate or reimplement those APIs.
+
+## Deep-doctor result on 2026-07-18
+
+The first live `apc cluster doctor lan-spike` run produced 12 passes and six
+failures. Host-specific addresses are omitted:
+
+- passed: control plane, published API, both Node conditions, one Ready probe
+  Pod per Mac, kubelet exec on both nodes, and Mac mini DNS/HTTPS egress;
+- failed: MacBook Pod DNS and HTTPS egress;
+- failed: direct Pod HTTP in both MacBook-to-mini and mini-to-MacBook
+  directions, which is the end-to-end VXLAN gate;
+- failed: ClusterIP access from both nodes because the selected endpoint was
+  across the broken route, with DNS also unavailable on the MacBook Pod.
+
+This is the desired diagnostic behavior: the cluster remains superficially
+`Ready`, but APC now returns a nonzero exit code and precise per-path
+remediation instead of treating readiness as proof of network health.
+
+The initial implementation requested asynchronous namespace deletion. That
+namespace remained `Terminating` because Kubernetes discovery of the remote
+Metrics API was stale across the broken route. The doctor now uses uniquely
+named Pods and a Service in `default`, records their exact names, and deletes
+those resources directly with zero grace instead of depending on namespace
+finalization.
+
+A final run with deterministic Service endpoint selection, exact-resource
+cleanup and public egress intentionally skipped reported 11 passes, two warnings
+and five network failures. No `apc-doctor-*` Pod or Service remained afterward.

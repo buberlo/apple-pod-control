@@ -99,8 +99,9 @@ func (execRunner) Run(ctx context.Context, binary string, arguments ...string) (
 }
 
 type Manager struct {
-	binary string
-	runner commandRunner
+	binary  string
+	runner  commandRunner
+	dialTCP func(context.Context, string) error
 }
 
 func NewManager(binary string) *Manager {
@@ -114,7 +115,17 @@ func NewManager(binary string) *Manager {
 			binary = "/usr/local/bin/container"
 		}
 	}
-	return &Manager{binary: binary, runner: execRunner{}}
+	return &Manager{
+		binary: binary,
+		runner: execRunner{},
+		dialTCP: func(ctx context.Context, address string) error {
+			connection, err := (&net.Dialer{}).DialContext(ctx, "tcp", address)
+			if err != nil {
+				return err
+			}
+			return connection.Close()
+		},
+	}
 }
 
 func (m *Manager) Create(ctx context.Context, config Config) (State, error) {

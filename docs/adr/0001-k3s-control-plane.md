@@ -49,6 +49,12 @@ standard I/O. This preserves watches, interactive terminals, plugins, exit
 behavior and future Kubernetes flags. `--legacy` explicitly retains access to
 the APC v1 REST API; APC does not build a second Kubernetes command parser.
 
+APC also owns an end-to-end cluster health gate because Kubernetes Node
+`Ready` does not cover the outer Apple VM's LAN/NAT state. `apc cluster doctor`
+uses disposable node-pinned Pods to verify DNS, egress, ClusterIP, kubelet exec
+and every directed cross-node HTTP path. Cross-node application traffic is the
+VXLAN acceptance test; merely binding or sending UDP 8472 is not sufficient.
+
 ## Verified on Apple container 1.0
 
 The following was exercised on an Apple Silicon MacBook with

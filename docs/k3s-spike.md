@@ -64,6 +64,7 @@ in `examples/helm/web/values.yaml`.
 
 ```bash
 bin/apc cluster status spike
+bin/apc cluster doctor spike
 bin/apc cluster stop spike
 bin/apc cluster start spike
 
