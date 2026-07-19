@@ -19,6 +19,7 @@ import (
 	"github.com/buberlo/apple-pod-control/internal/client"
 	"github.com/buberlo/apple-pod-control/internal/cluster"
 	"github.com/buberlo/apple-pod-control/internal/doctor"
+	"github.com/buberlo/apple-pod-control/internal/images"
 	"github.com/buberlo/apple-pod-control/internal/model"
 )
 
@@ -60,8 +61,66 @@ func NewCommand(out, errOut io.Writer) *cobra.Command {
 	command.AddCommand(
 		options.applyCommand(), options.getCommand(), options.describeCommand(), options.deleteCommand(),
 		options.rolloutCommand(), options.scaleCommand(), options.versionCommand(), options.doctorCommand(),
-		options.clusterCommand(), options.nodeCommand(), options.configCommand(), options.kubeconfigCommand(), options.kubectlCommand(),
+		options.clusterCommand(), options.nodeCommand(), options.imageCommand(), options.configCommand(), options.kubeconfigCommand(), options.kubectlCommand(),
 	)
+	return command
+}
+
+func (o *options) imageCommand() *cobra.Command {
+	command := &cobra.Command{Use: "image", Short: "Prefetch and distribute OCI images to APC K3s nodes"}
+	command.AddCommand(o.imagePrefetchCommand(), o.imageSyncCommand())
+	return command
+}
+
+func (o *options) imagePrefetchCommand() *cobra.Command {
+	config := images.Options{Pull: true}
+	command := &cobra.Command{
+		Use:   "prefetch IMAGE [IMAGE...]",
+		Short: "Pull images on this Mac and import them into the local K3s server",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(command *cobra.Command, args []string) error {
+			config.Cluster = o.clusterName(nil)
+			config.Images = args
+			config.Stdout = o.out
+			config.Stderr = o.errOut
+			result, err := images.NewManager().Transfer(command.Context(), config)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(o.out, "prefetched %d image(s), %s archive, %d target(s)\n", len(result.Images), byteSize(result.ArchiveBytes), len(result.Targets))
+			return nil
+		},
+	}
+	command.Flags().StringVar(&config.Platform, "platform", images.DefaultPlatform, "OCI platform to pull and import")
+	command.Flags().BoolVar(&config.Pull, "pull", true, "pull images into the Apple host store before export")
+	return command
+}
+
+func (o *options) imageSyncCommand() *cobra.Command {
+	config := images.Options{Pull: true}
+	command := &cobra.Command{
+		Use:   "sync IMAGE [IMAGE...] --peer USER@HOST",
+		Short: "Stream images into the local server and remote K3s agents over SSH",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(command *cobra.Command, args []string) error {
+			if len(config.Peers) == 0 {
+				return fmt.Errorf("at least one --peer is required")
+			}
+			config.Cluster = o.clusterName(nil)
+			config.Images = args
+			config.Stdout = o.out
+			config.Stderr = o.errOut
+			result, err := images.NewManager().Transfer(command.Context(), config)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(o.out, "synced %d image(s), %s archive, %d target(s)\n", len(result.Images), byteSize(result.ArchiveBytes), len(result.Targets))
+			return nil
+		},
+	}
+	command.Flags().StringSliceVar(&config.Peers, "peer", nil, "SSH peer receiving the agent image import (repeatable)")
+	command.Flags().StringVar(&config.Platform, "platform", images.DefaultPlatform, "OCI platform to pull and import")
+	command.Flags().BoolVar(&config.Pull, "pull", true, "pull images into the Apple host store before export")
 	return command
 }
 
@@ -270,8 +329,43 @@ func (o *options) clusterWriteJoinTokenCommand() *cobra.Command {
 
 func (o *options) nodeCommand() *cobra.Command {
 	command := &cobra.Command{Use: "node", Short: "Manage K3s worker nodes on this Mac"}
-	command.AddCommand(o.nodeJoinCommand(), o.nodeStatusCommand())
+	command.AddCommand(o.nodeJoinCommand(), o.nodeStatusCommand(), o.nodeStartCommand(), o.nodeStopCommand())
 	return command
+}
+
+func (o *options) nodeStartCommand() *cobra.Command {
+	var timeout time.Duration
+	command := &cobra.Command{
+		Use:   "start [CLUSTER]",
+		Short: "Start a stopped K3s agent from its saved configuration",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(command *cobra.Command, args []string) error {
+			state, err := cluster.NewManager("container").StartAgent(command.Context(), o.clusterName(args), timeout)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(o.out, "node.apc.dev/%s connected (%s)\n", state.NodeName, state.RuntimeState)
+			return nil
+		},
+	}
+	command.Flags().DurationVar(&timeout, "wait", 45*time.Second, "maximum time to wait for the agent connection")
+	return command
+}
+
+func (o *options) nodeStopCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "stop [CLUSTER]",
+		Short: "Stop the local K3s agent without deleting its state",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(command *cobra.Command, args []string) error {
+			name := o.clusterName(args)
+			if err := cluster.NewManager("container").StopAgent(command.Context(), name); err != nil {
+				return err
+			}
+			fmt.Fprintf(o.out, "node.apc.dev/%s stopped\n", name)
+			return nil
+		},
+	}
 }
 
 func (o *options) nodeJoinCommand() *cobra.Command {

@@ -31,6 +31,7 @@ const (
 	agentTokenMountDir  = "/run/secrets/apc"
 	agentTokenMountPath = agentTokenMountDir + "/agent-token"
 	dynamicNodeIPScript = `NODE_IP=$(hostname -i); NODE_IP=${NODE_IP%% *}; exec /bin/k3s "$@" --node-ip "$NODE_IP"`
+	agentNodeIPScript   = `mkdir -p /var/lib/rancher/k3s/apc-node-identity /etc/rancher; if [ ! -L /etc/rancher/node ]; then rm -rf /etc/rancher/node; ln -s /var/lib/rancher/k3s/apc-node-identity /etc/rancher/node; fi; NODE_IP=$(hostname -i); NODE_IP=${NODE_IP%% *}; exec /bin/k3s "$@" --node-ip "$NODE_IP"`
 )
 
 var (
@@ -205,7 +206,16 @@ func (m *Manager) Join(ctx context.Context, config AgentConfig) (State, error) {
 		if err := validateOwnedContainer(record, config.Name, "agent"); err != nil {
 			return State{}, err
 		}
-		if strings.EqualFold(record.Status.State, "stopped") {
+		recreate := strings.EqualFold(record.Status.State, "stopped")
+		if stored, loadErr := loadAgentConfig(config.Name); loadErr != nil || !sameAgentRuntimeConfig(stored, config) {
+			recreate = true
+		}
+		if recreate && strings.EqualFold(record.Status.State, "running") {
+			if _, stderr, stopErr := m.runner.Run(ctx, m.binary, "stop", containerName); stopErr != nil {
+				return State{}, commandError("stop K3s agent for configuration update", stderr, stopErr)
+			}
+		}
+		if recreate {
 			if err := m.deleteStoppedContainer(ctx, containerName); err != nil {
 				return State{}, err
 			}
@@ -223,7 +233,81 @@ func (m *Manager) Join(ctx context.Context, config AgentConfig) (State, error) {
 	if err := m.waitAgentConnected(ctx, containerName, config.StartupTimeout); err != nil {
 		return State{}, err
 	}
+	if err := saveAgentConfig(config); err != nil {
+		return State{}, err
+	}
 	state, err := m.AgentStatus(ctx, config.Name)
+	if err != nil {
+		return State{}, err
+	}
+	state.NodeName = config.NodeName
+	return state, nil
+}
+
+func (m *Manager) StopAgent(ctx context.Context, name string) error {
+	record, err := m.inspect(ctx, AgentContainerName(name))
+	if err != nil {
+		return err
+	}
+	if err := validateOwnedContainer(record, name, "agent"); err != nil {
+		return err
+	}
+	if strings.EqualFold(record.Status.State, "stopped") {
+		return nil
+	}
+	_, stderr, err := m.runner.Run(ctx, m.binary, "stop", AgentContainerName(name))
+	if err != nil {
+		return commandError("stop K3s agent", stderr, err)
+	}
+	return nil
+}
+
+func (m *Manager) StartAgent(ctx context.Context, name string, timeout time.Duration) (State, error) {
+	config, err := loadAgentConfig(name)
+	if err != nil {
+		return State{}, err
+	}
+	if timeout > 0 {
+		config.StartupTimeout = timeout
+	}
+	config, addressChanged, err := refreshAgentAdvertiseAddress(config)
+	if err != nil {
+		return State{}, err
+	}
+	if err := validatePrivateTokenFile(config.TokenFile); err != nil {
+		return State{}, err
+	}
+	record, err := m.inspect(ctx, AgentContainerName(name))
+	if err != nil {
+		return State{}, err
+	}
+	if err := validateOwnedContainer(record, name, "agent"); err != nil {
+		return State{}, err
+	}
+	if addressChanged && strings.EqualFold(record.Status.State, "running") {
+		if _, stderr, stopErr := m.runner.Run(ctx, m.binary, "stop", AgentContainerName(name)); stopErr != nil {
+			return State{}, commandError("stop K3s agent for LAN address update", stderr, stopErr)
+		}
+		record.Status.State = "stopped"
+	}
+	if strings.EqualFold(record.Status.State, "stopped") {
+		if err := m.ensureVolume(ctx, AgentVolumeName(name), name, "agent"); err != nil {
+			return State{}, err
+		}
+		if err := m.deleteStoppedContainer(ctx, AgentContainerName(name)); err != nil {
+			return State{}, err
+		}
+		if _, stderr, runErr := m.runner.Run(ctx, m.binary, AgentRunArguments(config)...); runErr != nil {
+			return State{}, commandError("recreate K3s agent", stderr, runErr)
+		}
+	}
+	if err := m.waitAgentConnected(ctx, AgentContainerName(name), config.StartupTimeout); err != nil {
+		return State{}, err
+	}
+	if err := saveAgentConfig(config); err != nil {
+		return State{}, err
+	}
+	state, err := m.AgentStatus(ctx, name)
 	if err != nil {
 		return State{}, err
 	}
@@ -359,12 +443,22 @@ func (m *Manager) Start(ctx context.Context, name string, timeout time.Duration)
 	if err != nil {
 		return State{}, err
 	}
+	config, addressChanged, err := refreshAdvertiseAddress(config)
+	if err != nil {
+		return State{}, err
+	}
 	record, err := m.inspect(ctx, ContainerName(name))
 	if err != nil {
 		return State{}, err
 	}
 	if err := validateOwnedContainer(record, name, "server"); err != nil {
 		return State{}, err
+	}
+	if addressChanged && strings.EqualFold(record.Status.State, "running") {
+		if _, stderr, stopErr := m.runner.Run(ctx, m.binary, "stop", ContainerName(name)); stopErr != nil {
+			return State{}, commandError("stop K3s node for LAN address update", stderr, stopErr)
+		}
+		record.Status.State = "stopped"
 	}
 	if strings.EqualFold(record.Status.State, "stopped") {
 		if err := m.ensureVolume(ctx, ServerVolumeName(name), name, "server"); err != nil {
@@ -383,6 +477,16 @@ func (m *Manager) Start(ctx context.Context, name string, timeout time.Duration)
 	if err := m.waitReady(ctx, ContainerName(name), config.NodeName, timeout); err != nil {
 		return State{}, err
 	}
+	kubeconfig, err := m.readKubeconfig(ctx, ContainerName(name), config.APIEndpoint())
+	if err != nil {
+		return State{}, err
+	}
+	if err := writePrivateFile(config.KubeconfigPath, kubeconfig); err != nil {
+		return State{}, err
+	}
+	if err := saveClusterConfig(config); err != nil {
+		return State{}, err
+	}
 	state, err := m.Status(ctx, name)
 	if err != nil {
 		return State{}, err
@@ -391,6 +495,72 @@ func (m *Manager) Start(ctx context.Context, name string, timeout time.Duration)
 		return State{}, err
 	}
 	return state, nil
+}
+
+func refreshAdvertiseAddress(config Config) (Config, bool, error) {
+	if config.AdvertiseAddress == "" {
+		return config, false, nil
+	}
+	addresses, err := net.InterfaceAddrs()
+	if err != nil {
+		return Config{}, false, fmt.Errorf("list host network addresses: %w", err)
+	}
+	updated, changed := updatedAddressOnExistingSubnet(config.AdvertiseAddress, addresses)
+	if changed {
+		config.AdvertiseAddress = updated
+	}
+	return config, changed, nil
+}
+
+func refreshAgentAdvertiseAddress(config AgentConfig) (AgentConfig, bool, error) {
+	addresses, err := net.InterfaceAddrs()
+	if err != nil {
+		return AgentConfig{}, false, fmt.Errorf("list host network addresses: %w", err)
+	}
+	updated, changed := updatedAddressOnExistingSubnet(config.AdvertiseAddress, addresses)
+	if changed {
+		config.AdvertiseAddress = updated
+	}
+	return config, changed, nil
+}
+
+func updatedAddressOnExistingSubnet(previous string, addresses []net.Addr) (string, bool) {
+	previousIP := net.ParseIP(previous)
+	if previousIP == nil {
+		return previous, false
+	}
+	for _, address := range addresses {
+		ip, _, ok := addressIPNet(address)
+		if ok && ip.Equal(previousIP) {
+			return previous, false
+		}
+	}
+	for _, address := range addresses {
+		ip, network, ok := addressIPNet(address)
+		if !ok || ip.IsLoopback() || (previousIP.To4() == nil) != (ip.To4() == nil) {
+			continue
+		}
+		if network.Contains(previousIP) {
+			return ip.String(), true
+		}
+	}
+	return previous, false
+}
+
+func addressIPNet(address net.Addr) (net.IP, *net.IPNet, bool) {
+	switch value := address.(type) {
+	case *net.IPNet:
+		return value.IP, value, true
+	case *net.IPAddr:
+		bits := 128
+		if value.IP.To4() != nil {
+			bits = 32
+		}
+		return value.IP, &net.IPNet{IP: value.IP, Mask: net.CIDRMask(bits, bits)}, true
+	default:
+		ip, network, err := net.ParseCIDR(address.String())
+		return ip, network, err == nil
+	}
 }
 
 func (m *Manager) WriteAgentToken(ctx context.Context, name, path string) (string, error) {
@@ -551,6 +721,14 @@ func AgentTokenPath(clusterName string) (string, error) {
 	return filepath.Join(configDirectory, "apc", "clusters", clusterName, "agent-token"), nil
 }
 
+func agentConfigPath(clusterName string) (string, error) {
+	configDirectory, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve user configuration directory: %w", err)
+	}
+	return filepath.Join(configDirectory, "apc", "clusters", clusterName, "agent.json"), nil
+}
+
 func clusterConfigPath(clusterName string) (string, error) {
 	configDirectory, err := os.UserConfigDir()
 	if err != nil {
@@ -628,7 +806,7 @@ func AgentRunArguments(config AgentConfig) []string {
 		"--label", "apc.dev/role=agent",
 		"--progress", "plain",
 		config.Image,
-		"-c", dynamicNodeIPScript, "apc-k3s",
+		"-c", agentNodeIPScript, "apc-k3s",
 		"agent",
 		"--server", config.ServerURL,
 		"--token-file", agentTokenMountPath,
@@ -921,6 +1099,9 @@ func (m *Manager) waitAgentConnected(ctx context.Context, containerName string, 
 		if inspectErr == nil && strings.EqualFold(record.Status.State, "running") {
 			stdout, stderr, logsErr := m.runner.Run(waitCtx, m.binary, "logs", containerName)
 			logs := currentAgentBootLogs(string(stdout) + string(stderr))
+			if strings.Contains(logs, "Node password rejected") {
+				return fmt.Errorf("K3s rejected the agent identity for a duplicate node name; delete the stale Kubernetes Node and retry the join")
+			}
 			if logsErr == nil && (strings.Contains(logs, "Node controller sync successful") || strings.Contains(logs, "Running flannel backend.")) {
 				return nil
 			}
@@ -1007,6 +1188,22 @@ func saveClusterConfig(config Config) error {
 	return nil
 }
 
+func saveAgentConfig(config AgentConfig) error {
+	path, err := agentConfigPath(config.Name)
+	if err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode agent configuration: %w", err)
+	}
+	data = append(data, '\n')
+	if err := writePrivateFile(path, data); err != nil {
+		return fmt.Errorf("save agent configuration: %w", err)
+	}
+	return nil
+}
+
 func loadClusterConfig(name string) (Config, error) {
 	path, err := clusterConfigPath(name)
 	if err != nil {
@@ -1025,6 +1222,40 @@ func loadClusterConfig(name string) (Config, error) {
 		return Config{}, fmt.Errorf("validate cluster configuration: %w", err)
 	}
 	return config, nil
+}
+
+func loadAgentConfig(name string) (AgentConfig, error) {
+	path, err := agentConfigPath(name)
+	if err != nil {
+		return AgentConfig{}, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return AgentConfig{}, fmt.Errorf("read agent configuration: %w", err)
+	}
+	var config AgentConfig
+	if err := json.Unmarshal(data, &config); err != nil {
+		return AgentConfig{}, fmt.Errorf("decode agent configuration: %w", err)
+	}
+	config, err = normalizeAgentConfig(config)
+	if err != nil {
+		return AgentConfig{}, fmt.Errorf("validate agent configuration: %w", err)
+	}
+	return config, nil
+}
+
+func sameAgentRuntimeConfig(left, right AgentConfig) bool {
+	return left.Name == right.Name &&
+		left.NodeName == right.NodeName &&
+		left.ServerURL == right.ServerURL &&
+		left.TokenFile == right.TokenFile &&
+		left.Image == right.Image &&
+		left.CPUs == right.CPUs &&
+		left.Memory == right.Memory &&
+		left.ListenAddress == right.ListenAddress &&
+		left.AdvertiseAddress == right.AdvertiseAddress &&
+		left.VXLANPort == right.VXLANPort &&
+		left.KubeletPort == right.KubeletPort
 }
 
 func validatePrivateTokenFile(path string) error {

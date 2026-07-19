@@ -65,6 +65,7 @@ in `examples/helm/web/values.yaml`.
 ```bash
 bin/apc cluster status spike
 bin/apc cluster doctor spike
+bin/apc image prefetch docker.io/library/busybox:1.36.1
 bin/apc cluster stop spike
 bin/apc cluster start spike
 
@@ -83,6 +84,11 @@ that contains `/var/lib/rancher/k3s`. This preserves Kubernetes and Helm state
 while avoiding an Apple container 1.0 issue where a directly restarted,
 port-published VM can lose outbound connectivity. Destructive cluster deletion
 is deliberately not part of this first spike command set.
+
+On LAN clusters, `cluster start` detects a DHCP address change on the same host
+subnet, recreates K3s with the new external IP/TLS SAN, and rewrites kubeconfig.
+Agent configuration and the K3s node password are persisted so `apc node
+stop/start` can replace the Mini's disposable VM without losing its identity.
 
 ## LAN preparation for the Mac mini gate
 

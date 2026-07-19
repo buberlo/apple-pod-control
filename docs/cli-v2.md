@@ -97,6 +97,27 @@ as Metrics Server is unreachable. `--keep` retains the listed resources for
 manual inspection; the operator must then delete them. The doctor exits nonzero
 when a required check fails, making it suitable as an alpha acceptance gate.
 
+## Image prefetch and sync
+
+Workload images can be distributed without registry access from the K3s VMs:
+
+```bash
+apc image prefetch docker.io/library/busybox:1.36.1
+apc image sync docker.io/library/busybox:1.36.1 \
+  --peer user@mac-mini.local
+```
+
+APC pulls the requested `linux/arm64` image into Apple's host image store,
+exports one private OCI archive, imports and verifies exact references in the
+local nested K3s containerd, then streams the same archive over key-only SSH to
+each peer's APC agent container. The archive is staged in a private temporary
+directory and removed on both success and failure; it is never written to the
+remote Mac. `--pull=false` reuses the host cache.
+
+Image references, cluster names, platforms and SSH peers are validated before
+constructing commands. Sync targets the persistent K3s data volumes, so images
+remain available when APC replaces the surrounding Apple VM.
+
 ## APC v1 compatibility
 
 If no current v2 cluster exists, overlapping commands retain their APC v1

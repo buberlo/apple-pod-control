@@ -14,7 +14,7 @@ import (
 
 var apcCommands = map[string]struct{}{
 	"cluster": {}, "completion": {}, "config": {}, "doctor": {}, "help": {},
-	"kubeconfig": {}, "kubectl": {}, "node": {}, "version": {},
+	"image": {}, "kubeconfig": {}, "kubectl": {}, "node": {}, "version": {},
 }
 
 var leadingFlagsWithValues = map[string]struct{}{

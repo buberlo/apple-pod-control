@@ -52,11 +52,19 @@ func TestAgentRunArgumentsMountProtectedTokenWithoutPuttingItInArguments(t *test
 		"type=bind,source=/private,target=/run/secrets/apc,readonly",
 		"--token-file", agentTokenMountPath, "--node-external-ip", "192.0.2.20",
 		"default,mac=" + DeterministicMAC("home", "agent") + ",mtu=1280",
-		"--entrypoint", "/bin/sh", dynamicNodeIPScript,
+		"--entrypoint", "/bin/sh", agentNodeIPScript,
 		AgentVolumeName("home") + ":/var/lib/rancher/k3s",
 	} {
 		if !contains(arguments, required) {
 			t.Fatalf("arguments do not contain %q: %#v", required, arguments)
+		}
+	}
+}
+
+func TestAgentEntrypointPersistsK3sNodeIdentity(t *testing.T) {
+	for _, required := range []string{"/var/lib/rancher/k3s/apc-node-identity", "ln -s", "/etc/rancher/node"} {
+		if !strings.Contains(agentNodeIPScript, required) {
+			t.Fatalf("agent entrypoint is missing %q: %s", required, agentNodeIPScript)
 		}
 	}
 }
@@ -222,6 +230,54 @@ func TestCurrentClusterRoundTripAndListing(t *testing.T) {
 	if !reflect.DeepEqual(clusters, []string{"alpha", "zeta"}) {
 		t.Fatalf("clusters = %#v", clusters)
 	}
+}
+
+func TestUpdatedAddressOnExistingSubnetFollowsDHCPChange(t *testing.T) {
+	oldAddress := mustCIDR(t, "192.168.50.10/24")
+	newAddress := mustCIDR(t, "192.168.50.11/24")
+	loopback := mustCIDR(t, "127.0.0.1/8")
+
+	updated, changed := updatedAddressOnExistingSubnet("192.168.50.10", []net.Addr{loopback, newAddress})
+	if !changed || updated != "192.168.50.11" {
+		t.Fatalf("updated = %q, changed = %t", updated, changed)
+	}
+	unchanged, changed := updatedAddressOnExistingSubnet("192.168.50.10", []net.Addr{oldAddress, newAddress})
+	if changed || unchanged != "192.168.50.10" {
+		t.Fatalf("unchanged = %q, changed = %t", unchanged, changed)
+	}
+}
+
+func TestAgentConfigRoundTrip(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
+	config, err := normalizeAgentConfig(AgentConfig{
+		Name: "home", NodeName: "mini", ServerURL: "https://192.0.2.10:16443",
+		TokenFile: filepath.Join(home, "token"), AdvertiseAddress: "192.0.2.20",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := saveAgentConfig(config); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadAgentConfig("home")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameAgentRuntimeConfig(config, loaded) {
+		t.Fatalf("loaded config differs: %#v", loaded)
+	}
+}
+
+func mustCIDR(t *testing.T, value string) *net.IPNet {
+	t.Helper()
+	ip, network, err := net.ParseCIDR(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	network.IP = ip
+	return network
 }
 
 func contains(values []string, value string) bool {

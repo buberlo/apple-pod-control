@@ -52,6 +52,7 @@ apc exec -it deployment/web -- /bin/sh
 apc rollout status deployment/web
 apc port-forward service/web 8081:80
 apc cluster doctor
+apc image sync docker.io/library/busybox:1.36.1 --peer user@mac-mini.local
 ```
 
 APC owns cluster lifecycle and context selection. Kubernetes continues to own
@@ -62,6 +63,11 @@ its API and command semantics; Helm uses the same generated kubeconfig. See the
 short-lived probe Pod on every Ready node and checks host API reachability,
 kubelet exec, DNS, HTTPS egress, ClusterIP and directed cross-node HTTP. The
 uniquely named probe Pods and Service are deleted automatically.
+
+`apc image prefetch` imports host-pulled ARM64 images into the local nested K3s
+containerd. `apc image sync` additionally streams the private OCI archive over
+key-only SSH into remote APC agents, allowing deterministic scheduling even
+when an Apple VM cannot reach a public registry.
 
 ## Requirements
 

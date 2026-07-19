@@ -16,6 +16,7 @@ intentionally omitted.
 | Native `kubectl` and Helm | Pass | Host clients reached the generated kubeconfig; chart install completed |
 | kubectl-compatible `apc` frontend | Pass | `get`, server-side dry-run `apply`, `logs`, `exec`, `auth can-i` and `cluster-info` ran against K3s |
 | Deep `apc cluster doctor` | Pass as a diagnostic | Created one Pod per node, found the known network failures, and verified exact-resource cleanup |
+| Host-mediated image sync | Pass | A new ARM64 image was streamed into both K3s stores and ran with `imagePullPolicy: Never` on both Macs |
 | Second physical node | Pass | Mac mini agent joined and reached `Ready` |
 | Scheduler placement across hosts | Pass | Two nginx replicas, one on each physical Mac |
 | Bidirectional cross-host Pod HTTP | Pass before restart test | Pods in different Flannel subnets reached each other in both directions |
@@ -47,15 +48,13 @@ intentionally omitted.
 
 ## Remaining gates for a usable alpha
 
-1. Add `apc image prefetch/sync` for deterministic or air-gapped recovery when
-   a node cannot pull OCI layers.
-2. Repeat automated cold-start and simultaneous-restart tests after restoring
+1. Repeat automated cold-start and simultaneous-restart tests after restoring
    the affected Mac's Apple-VM networking; run them in CI on two real Macs.
-3. Add host firewall management and a secure host overlay before leaving a
+2. Add host firewall management and a secure host overlay before leaving a
    trusted LAN. Do not expose VXLAN directly to an untrusted network.
-4. Select a restart-safe CNI/network-policy implementation and re-enable
+3. Select a restart-safe CNI/network-policy implementation and re-enable
    Kubernetes NetworkPolicy semantics.
-5. Add cluster deletion, upgrades, backup/restore and three-server embedded-etcd
+4. Add cluster deletion, upgrades, backup/restore and three-server embedded-etcd
    HA. A two-node server/agent cluster is not control-plane HA.
 
 The kubectl-compatible APC frontend is now implemented. Additional Kubernetes
@@ -89,3 +88,31 @@ finalization.
 A final run with deterministic Service endpoint selection, exact-resource
 cleanup and public egress intentionally skipped reported 11 passes, two warnings
 and five network failures. No `apc-doctor-*` Pod or Service remained afterward.
+
+## Cold-start and image-sync result on 2026-07-19
+
+After the MacBook's Apple container service stopped, APC recreated the server
+from its persistent volume. DHCP had assigned the MacBook a new LAN address;
+the hardened start path detected the change, updated K3s external IP and TLS
+SAN, rewrote kubeconfig and preserved Kubernetes/Helm state.
+
+The agent VM was also replaced. APC now persists its local K3s node password
+inside the named data volume and saves non-secret join configuration, preventing
+future VM replacement from losing node identity. The one stale pre-fix Node was
+deleted and rejoined cleanly.
+
+The next full doctor run passed both directed cross-node HTTP paths, DNS from
+both nodes, ClusterIP from both nodes, API and kubelet checks. Public HTTPS
+egress from the MacBook K3s VM remains the only failure; the Mac mini egress
+passes.
+
+`apc image sync` then pulled `busybox:1.36.1` through the healthy macOS host,
+streamed a private ARM64 OCI archive into both nested K3s containerd stores and
+verified the exact references. Node-pinned test Pods using `imagePullPolicy:
+Never` reached `Ready` and executed as `aarch64` on both Macs. Test Pods and the
+temporary host archive were removed.
+
+Finally, `apc node stop/start` replaced the Mini agent from its saved
+configuration and persistent identity. A post-restart doctor with public egress
+intentionally skipped reported 16 passes, two warnings and zero failures,
+including both directed VXLAN paths and deterministic ClusterIP routing.

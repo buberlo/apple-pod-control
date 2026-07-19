@@ -55,6 +55,12 @@ uses disposable node-pinned Pods to verify DNS, egress, ClusterIP, kubelet exec
 and every directed cross-node HTTP path. Cross-node application traffic is the
 VXLAN acceptance test; merely binding or sending UDP 8472 is not sufficient.
 
+Because Apple-VM public egress may fail independently of the macOS host, APC
+uses the host image store as the distribution source. OCI archives are streamed
+into K3s containerd locally and over authenticated SSH to agents. Workloads can
+therefore use `imagePullPolicy: Never` as a deterministic air-gap acceptance
+test without adding a second registry service to the spike.
+
 ## Verified on Apple container 1.0
 
 The following was exercised on an Apple Silicon MacBook with
