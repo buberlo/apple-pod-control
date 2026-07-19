@@ -22,6 +22,7 @@ func TestServerRunArgumentsUsePinnedARM64ImageAndVXLAN(t *testing.T) {
 		"--node-external-ip", "192.0.2.10", "--flannel-external-ip",
 		"default,mac=" + DeterministicMAC("home", "server") + ",mtu=1280",
 		"--entrypoint", "/bin/sh", dynamicNodeIPScript,
+		"APC_STABLE_NODE_IP=",
 		"--disable-network-policy",
 		ServerVolumeName("home") + ":/var/lib/rancher/k3s",
 	} {
@@ -31,6 +32,29 @@ func TestServerRunArgumentsUsePinnedARM64ImageAndVXLAN(t *testing.T) {
 	}
 	if contains(arguments, "wireguard-native") {
 		t.Fatalf("wireguard must not be selected: %#v", arguments)
+	}
+}
+
+func TestServerRunArgumentsCanEnableNetworkPolicyController(t *testing.T) {
+	arguments := ServerRunArguments(Config{Name: "home", EnableNetworkPolicy: true})
+	if contains(arguments, "--disable-network-policy") {
+		t.Fatalf("network policy controller was disabled: %#v", arguments)
+	}
+	arguments = ServerRunArguments(Config{Name: "home"})
+	if !contains(arguments, "--disable-network-policy") {
+		t.Fatalf("safe alpha default must remain explicit: %#v", arguments)
+	}
+}
+
+func TestServerEntrypointKeepsInternalIPStableAcrossVMRecreation(t *testing.T) {
+	for _, required := range []string{"APC_STABLE_NODE_IP", "EFFECTIVE_NODE_IP", "ip address add", `--node-ip "$EFFECTIVE_NODE_IP"`} {
+		if !strings.Contains(dynamicNodeIPScript, required) {
+			t.Fatalf("server entrypoint is missing %q: %s", required, dynamicNodeIPScript)
+		}
+	}
+	arguments := ServerRunArguments(Config{Name: "home", StableNodeIP: "192.168.64.20"})
+	if !contains(arguments, "APC_STABLE_NODE_IP=192.168.64.20") {
+		t.Fatalf("stable node IP not passed to server: %#v", arguments)
 	}
 }
 
@@ -51,6 +75,8 @@ func TestAgentRunArgumentsMountProtectedTokenWithoutPuttingItInArguments(t *test
 		"0.0.0.0:8472:8472/udp", "0.0.0.0:10250:10250/tcp",
 		"type=bind,source=/private,target=/run/secrets/apc,readonly",
 		"--token-file", agentTokenMountPath, "--node-external-ip", "192.0.2.20",
+		"APC_PREVIOUS_NODE_IP=",
+		"APC_SERVER_URL=https://192.0.2.10:16443", "APC_NODE_NAME=mac-mini",
 		"default,mac=" + DeterministicMAC("home", "agent") + ",mtu=1280",
 		"--entrypoint", "/bin/sh", agentNodeIPScript,
 		AgentVolumeName("home") + ":/var/lib/rancher/k3s",
@@ -62,7 +88,7 @@ func TestAgentRunArgumentsMountProtectedTokenWithoutPuttingItInArguments(t *test
 }
 
 func TestAgentEntrypointPersistsK3sNodeIdentity(t *testing.T) {
-	for _, required := range []string{"/var/lib/rancher/k3s/apc-node-identity", "ln -s", "/etc/rancher/node"} {
+	for _, required := range []string{"/var/lib/rancher/k3s/apc-node-identity", "ln -s", "/etc/rancher/node", "kubelet.kubeconfig", "APC_SERVER_URL", "APC_NODE_NAME", "STORED_NODE_IP", "EFFECTIVE_NODE_IP", "ip address add", `--node-ip "$EFFECTIVE_NODE_IP"`} {
 		if !strings.Contains(agentNodeIPScript, required) {
 			t.Fatalf("agent entrypoint is missing %q: %s", required, agentNodeIPScript)
 		}
@@ -107,11 +133,23 @@ func TestWaitReadyRequiresKubernetesInternalIPToMatchCurrentVM(t *testing.T) {
 	manager := NewManager("container")
 	manager.runner = runner
 
-	if err := manager.waitReady(context.Background(), "node", "macbook", 2*time.Second); err != nil {
+	if err := manager.waitReady(context.Background(), "node", "macbook", "", 2*time.Second); err != nil {
 		t.Fatal(err)
 	}
 	if len(runner.calls) != 4 {
 		t.Fatalf("calls = %d, want 4; stale Kubernetes IP was accepted", len(runner.calls))
+	}
+}
+
+func TestWaitReadyAcceptsConfiguredStableNodeIP(t *testing.T) {
+	runner := &scriptedRunner{responses: []runnerResponse{{stdout: []byte("True;192.168.64.20")}}}
+	manager := NewManager("container")
+	manager.runner = runner
+	if err := manager.waitReady(context.Background(), "node", "macbook", "192.168.64.20", 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("stable node IP unexpectedly required primary VM inspection: %#v", runner.calls)
 	}
 }
 
@@ -195,6 +233,30 @@ func TestStatusSelectsNodeMatchingServerVMAddress(t *testing.T) {
 	}
 	if state.NodeName != "server-second" || !state.NodeReady || state.K3sVersion != "v1.36.2+k3s1" {
 		t.Fatalf("unexpected server state: %#v", state)
+	}
+}
+
+func TestStatusPrefersSavedServerNodeNameWhenInternalIPsCollide(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
+	config, err := normalizeConfig(Config{Name: "home", NodeName: "server-node"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := saveClusterConfig(config); err != nil {
+		t.Fatal(err)
+	}
+	inspect := `[{"configuration":{"labels":{"apc.dev/managed":"true","apc.dev/cluster":"home","apc.dev/role":"server"}},"status":{"state":"running","networks":[{"ipv4Address":"192.168.64.20/24"}]}}]`
+	nodes := `{"items":[{"metadata":{"name":"server-node"},"status":{"nodeInfo":{"kubeletVersion":"server-version"},"conditions":[{"type":"Ready","status":"True"}],"addresses":[{"type":"InternalIP","address":"192.168.64.20"}]}},{"metadata":{"name":"agent-node"},"status":{"nodeInfo":{"kubeletVersion":"agent-version"},"conditions":[{"type":"Ready","status":"True"}],"addresses":[{"type":"InternalIP","address":"192.168.64.20"}]}}]}`
+	manager := NewManager("container")
+	manager.runner = &scriptedRunner{responses: []runnerResponse{{stdout: []byte(inspect)}, {stdout: []byte(nodes)}}}
+	state, err := manager.Status(context.Background(), "home")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.NodeName != "server-node" || state.K3sVersion != "server-version" {
+		t.Fatalf("wrong node selected: %#v", state)
 	}
 }
 

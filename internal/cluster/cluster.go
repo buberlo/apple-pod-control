@@ -31,8 +31,8 @@ const (
 	defaultVolumeSize   = "8G"
 	agentTokenMountDir  = "/run/secrets/apc"
 	agentTokenMountPath = agentTokenMountDir + "/agent-token"
-	dynamicNodeIPScript = `NODE_IP=$(hostname -i); NODE_IP=${NODE_IP%% *}; exec /bin/k3s "$@" --node-ip "$NODE_IP"`
-	agentNodeIPScript   = `mkdir -p /var/lib/rancher/k3s/apc-node-identity /etc/rancher; if [ ! -L /etc/rancher/node ]; then rm -rf /etc/rancher/node; ln -s /var/lib/rancher/k3s/apc-node-identity /etc/rancher/node; fi; NODE_IP=$(hostname -i); NODE_IP=${NODE_IP%% *}; exec /bin/k3s "$@" --node-ip "$NODE_IP"`
+	dynamicNodeIPScript = `NODE_IP=$(hostname -i); NODE_IP=${NODE_IP%% *}; NODE_CIDR=$(ip -o -4 addr show dev eth0 scope global | awk 'NR == 1 {print $4}'); PREFIX=${NODE_CIDR#*/}; EFFECTIVE_NODE_IP=${APC_STABLE_NODE_IP:-$NODE_IP}; if [ "$EFFECTIVE_NODE_IP" != "$NODE_IP" ]; then ip address add "$EFFECTIVE_NODE_IP/$PREFIX" dev eth0 2>/dev/null || true; fi; exec /bin/k3s "$@" --node-ip "$EFFECTIVE_NODE_IP"`
+	agentNodeIPScript   = `mkdir -p /var/lib/rancher/k3s/apc-node-identity /etc/rancher; if [ ! -L /etc/rancher/node ]; then rm -rf /etc/rancher/node; ln -s /var/lib/rancher/k3s/apc-node-identity /etc/rancher/node; fi; NODE_IP=$(hostname -i); NODE_IP=${NODE_IP%% *}; NODE_CIDR=$(ip -o -4 addr show dev eth0 scope global | awk 'NR == 1 {print $4}'); PREFIX=${NODE_CIDR#*/}; STORED_NODE_IP=""; if [ -f /var/lib/rancher/k3s/agent/kubelet.kubeconfig ]; then STORED_NODE_IP=$(/bin/kubectl --request-timeout=5s --kubeconfig /var/lib/rancher/k3s/agent/kubelet.kubeconfig --server "$APC_SERVER_URL" get node "$APC_NODE_NAME" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true); fi; EFFECTIVE_NODE_IP=${STORED_NODE_IP:-$APC_PREVIOUS_NODE_IP}; EFFECTIVE_NODE_IP=${EFFECTIVE_NODE_IP:-$NODE_IP}; if [ "$EFFECTIVE_NODE_IP" != "$NODE_IP" ]; then ip address add "$EFFECTIVE_NODE_IP/$PREFIX" dev eth0 2>/dev/null || true; fi; exec /bin/k3s "$@" --node-ip "$EFFECTIVE_NODE_IP"`
 )
 
 var (
@@ -43,19 +43,21 @@ var (
 var dnsLabel = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 
 type Config struct {
-	Name             string
-	NodeName         string
-	Image            string
-	CPUs             int
-	Memory           string
-	ListenAddress    string
-	AdvertiseAddress string
-	APIPort          int
-	VXLANPort        int
-	KubeletPort      int
-	StartupTimeout   time.Duration
-	KubeconfigPath   string
-	DisableTraefik   bool
+	Name                string
+	NodeName            string
+	Image               string
+	CPUs                int
+	Memory              string
+	ListenAddress       string
+	AdvertiseAddress    string
+	APIPort             int
+	VXLANPort           int
+	KubeletPort         int
+	StartupTimeout      time.Duration
+	KubeconfigPath      string
+	DisableTraefik      bool
+	EnableNetworkPolicy bool
+	StableNodeIP        string
 }
 
 type AgentConfig struct {
@@ -71,6 +73,7 @@ type AgentConfig struct {
 	VXLANPort        int
 	KubeletPort      int
 	StartupTimeout   time.Duration
+	PreviousNodeIP   string
 }
 
 type State struct {
@@ -83,6 +86,7 @@ type State struct {
 	NodeReady    bool   `json:"nodeReady" yaml:"nodeReady"`
 	K3sVersion   string `json:"k3sVersion,omitempty" yaml:"k3sVersion,omitempty"`
 	Kubeconfig   string `json:"kubeconfig,omitempty" yaml:"kubeconfig,omitempty"`
+	InternalIP   string `json:"internalIP,omitempty" yaml:"internalIP,omitempty"`
 }
 
 type commandRunner interface {
@@ -179,7 +183,7 @@ func (m *Manager) Create(ctx context.Context, config Config) (State, error) {
 		return State{}, inspectErr
 	}
 
-	if err := m.waitReady(ctx, containerName, config.NodeName, config.StartupTimeout); err != nil {
+	if err := m.waitReady(ctx, containerName, config.NodeName, config.StableNodeIP, config.StartupTimeout); err != nil {
 		return State{}, err
 	}
 	kubeconfig, err := m.readKubeconfig(ctx, containerName, config.APIEndpoint())
@@ -200,6 +204,12 @@ func (m *Manager) Create(ctx context.Context, config Config) (State, error) {
 		return State{}, err
 	}
 	state.Kubeconfig = config.KubeconfigPath
+	if config.StableNodeIP == "" && state.InternalIP != "" {
+		config.StableNodeIP = state.InternalIP
+		if err := saveClusterConfig(config); err != nil {
+			return State{}, err
+		}
+	}
 	return state, nil
 }
 
@@ -248,11 +258,14 @@ func (m *Manager) Join(ctx context.Context, config AgentConfig) (State, error) {
 	if err := m.waitAgentConnected(ctx, containerName, config.StartupTimeout); err != nil {
 		return State{}, err
 	}
-	if err := saveAgentConfig(config); err != nil {
-		return State{}, err
-	}
 	state, err := m.AgentStatus(ctx, config.Name)
 	if err != nil {
+		return State{}, err
+	}
+	if config.PreviousNodeIP == "" {
+		config.PreviousNodeIP = state.Address
+	}
+	if err := saveAgentConfig(config); err != nil {
 		return State{}, err
 	}
 	state.NodeName = config.NodeName
@@ -323,11 +336,14 @@ func (m *Manager) StartAgent(ctx context.Context, name string, timeout time.Dura
 	if err := m.waitAgentConnected(ctx, AgentContainerName(name), config.StartupTimeout); err != nil {
 		return State{}, err
 	}
-	if err := saveAgentConfig(config); err != nil {
-		return State{}, err
-	}
 	state, err := m.AgentStatus(ctx, name)
 	if err != nil {
+		return State{}, err
+	}
+	if config.PreviousNodeIP == "" {
+		config.PreviousNodeIP = state.Address
+	}
+	if err := saveAgentConfig(config); err != nil {
 		return State{}, err
 	}
 	state.NodeName = config.NodeName
@@ -383,9 +399,17 @@ func (m *Manager) Status(ctx context.Context, name string) (State, error) {
 	}
 	if len(nodes.Items) > 0 {
 		selected := &nodes.Items[0]
+		expectedNodeName := ""
+		if config, configErr := loadClusterConfig(name); configErr == nil {
+			expectedNodeName = config.NodeName
+		}
 		for index := range nodes.Items {
+			if expectedNodeName != "" && nodes.Items[index].Metadata.Name == expectedNodeName {
+				selected = &nodes.Items[index]
+				break
+			}
 			for _, address := range nodes.Items[index].Status.Addresses {
-				if address.Type == "InternalIP" && address.Address == state.Address {
+				if expectedNodeName == "" && address.Type == "InternalIP" && address.Address == state.Address {
 					selected = &nodes.Items[index]
 				}
 			}
@@ -395,6 +419,12 @@ func (m *Manager) Status(ctx context.Context, name string) (State, error) {
 		for _, condition := range selected.Status.Conditions {
 			if condition.Type == "Ready" {
 				state.NodeReady = condition.Status == "True"
+				break
+			}
+		}
+		for _, address := range selected.Status.Addresses {
+			if address.Type == "InternalIP" {
+				state.InternalIP = address.Address
 				break
 			}
 		}
@@ -497,7 +527,7 @@ func (m *Manager) Start(ctx context.Context, name string, timeout time.Duration)
 	if timeout == 0 {
 		timeout = 2 * time.Minute
 	}
-	if err := m.waitReady(ctx, ContainerName(name), config.NodeName, timeout); err != nil {
+	if err := m.waitReady(ctx, ContainerName(name), config.NodeName, config.StableNodeIP, timeout); err != nil {
 		return State{}, err
 	}
 	kubeconfig, err := m.readKubeconfig(ctx, ContainerName(name), config.APIEndpoint())
@@ -516,6 +546,12 @@ func (m *Manager) Start(ctx context.Context, name string, timeout time.Duration)
 	}
 	if err := SetCurrentCluster(name); err != nil {
 		return State{}, err
+	}
+	if config.StableNodeIP == "" && state.InternalIP != "" {
+		config.StableNodeIP = state.InternalIP
+		if err := saveClusterConfig(config); err != nil {
+			return State{}, err
+		}
 	}
 	return state, nil
 }
@@ -777,6 +813,7 @@ func ServerRunArguments(config Config) []string {
 		"--network", "default,mac=" + DeterministicMAC(config.Name, "server") + ",mtu=1280",
 		"--entrypoint", "/bin/sh",
 		"--volume", ServerVolumeName(config.Name) + ":/var/lib/rancher/k3s",
+		"--env", "APC_STABLE_NODE_IP=" + config.StableNodeIP,
 		"--publish", fmt.Sprintf("%s:%d:%d/tcp", config.ListenAddress, config.APIPort, config.APIPort),
 		"--label", "apc.dev/managed=true",
 		"--label", "apc.dev/cluster=" + config.Name,
@@ -798,8 +835,10 @@ func ServerRunArguments(config Config) []string {
 		"--write-kubeconfig-mode", "600",
 		"--tls-san", config.APIAddress(),
 		"--flannel-backend", "vxlan",
-		"--disable-network-policy",
 	)
+	if !config.EnableNetworkPolicy {
+		arguments = append(arguments, "--disable-network-policy")
+	}
 	if config.AdvertiseAddress != "" {
 		arguments = append(arguments,
 			"--node-external-ip", config.AdvertiseAddress,
@@ -824,6 +863,9 @@ func AgentRunArguments(config AgentConfig) []string {
 		"--publish", fmt.Sprintf("%s:%d:8472/udp", config.ListenAddress, config.VXLANPort),
 		"--publish", fmt.Sprintf("%s:%d:10250/tcp", config.ListenAddress, config.KubeletPort),
 		"--mount", fmt.Sprintf("type=bind,source=%s,target=%s,readonly", filepath.Dir(config.TokenFile), agentTokenMountDir),
+		"--env", "APC_PREVIOUS_NODE_IP=" + config.PreviousNodeIP,
+		"--env", "APC_SERVER_URL=" + config.ServerURL,
+		"--env", "APC_NODE_NAME=" + config.NodeName,
 		"--label", "apc.dev/managed=true",
 		"--label", "apc.dev/cluster=" + config.Name,
 		"--label", "apc.dev/role=agent",
@@ -871,6 +913,9 @@ func normalizeConfig(config Config) (Config, error) {
 	}
 	if config.AdvertiseAddress != "" && net.ParseIP(config.AdvertiseAddress) == nil {
 		return Config{}, fmt.Errorf("advertise address must be an IP address")
+	}
+	if config.StableNodeIP != "" && net.ParseIP(config.StableNodeIP) == nil {
+		return Config{}, fmt.Errorf("stable node IP must be a valid IP address")
 	}
 	if config.ListenAddress == "0.0.0.0" && config.AdvertiseAddress == "" {
 		return Config{}, fmt.Errorf("advertise address is required when listening on all interfaces")
@@ -941,6 +986,9 @@ func normalizeAgentConfig(config AgentConfig) (AgentConfig, error) {
 	}
 	if config.AdvertiseAddress == "" || net.ParseIP(config.AdvertiseAddress) == nil {
 		return AgentConfig{}, fmt.Errorf("advertise address must be a valid LAN IP address")
+	}
+	if config.PreviousNodeIP != "" && net.ParseIP(config.PreviousNodeIP) == nil {
+		return AgentConfig{}, fmt.Errorf("previous node IP must be a valid IP address")
 	}
 	if config.ServerURL == "" {
 		return AgentConfig{}, fmt.Errorf("server URL is required")
@@ -1076,7 +1124,7 @@ func validateOwnedContainer(record inspectRecord, clusterName, role string) erro
 	return nil
 }
 
-func (m *Manager) waitReady(ctx context.Context, containerName, nodeName string, timeout time.Duration) error {
+func (m *Manager) waitReady(ctx context.Context, containerName, nodeName, expectedNodeIP string, timeout time.Duration) error {
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	ticker := time.NewTicker(time.Second)
@@ -1090,11 +1138,17 @@ func (m *Manager) waitReady(ctx context.Context, containerName, nodeName string,
 		if err == nil {
 			parts := strings.Split(strings.TrimSpace(string(stdout)), ";")
 			if len(parts) == 2 && parts[0] == "True" {
-				record, inspectErr := m.inspect(waitCtx, containerName)
-				if inspectErr == nil && len(record.Status.Networks) > 0 {
-					currentIP := strings.Split(record.Status.Networks[0].IPv4Address, "/")[0]
-					if parts[1] == currentIP {
+				if expectedNodeIP != "" {
+					if parts[1] == expectedNodeIP {
 						return nil
+					}
+				} else {
+					record, inspectErr := m.inspect(waitCtx, containerName)
+					if inspectErr == nil && len(record.Status.Networks) > 0 {
+						currentIP := strings.Split(record.Status.Networks[0].IPv4Address, "/")[0]
+						if parts[1] == currentIP {
+							return nil
+						}
 					}
 				}
 			}

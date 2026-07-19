@@ -9,9 +9,19 @@ service:
   type: ClusterIP
   port: 80
 
+networkPolicy:
+  enabled: true
+  allowFromAllNamespaces: false
+
+podDisruptionBudget:
+  enabled: false
+  maxUnavailable: 1
+
 topologySpread:
   enabled: true
   whenUnsatisfiable: ScheduleAnyway
+
+tolerations: []
 
 resources:
   requests:

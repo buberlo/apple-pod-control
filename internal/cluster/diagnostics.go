@@ -178,6 +178,7 @@ func (m *Manager) Diagnose(ctx context.Context, name string, options DiagnoseOpt
 		return report, nil
 	}
 	readyNodes := make([]diagnosticNode, 0, len(nodeList.Items))
+	internalIPOwners := make(map[string]string, len(nodeList.Items))
 	for _, node := range nodeList.Items {
 		ready := nodeReady(node)
 		detail := nodeAddressSummary(node)
@@ -189,6 +190,16 @@ func (m *Manager) Diagnose(ctx context.Context, name string, options DiagnoseOpt
 			readyNodes = append(readyNodes, node)
 		} else {
 			add("node/"+node.Metadata.Name, DiagnosticFail, "NotReady, "+detail, "inspect node conditions and kubelet logs")
+		}
+		for _, address := range node.Status.Addresses {
+			if address.Type != "InternalIP" || net.ParseIP(address.Address) == nil {
+				continue
+			}
+			if owner, duplicate := internalIPOwners[address.Address]; duplicate {
+				add("node-internal-ip/"+address.Address, DiagnosticFail, owner+" and "+node.Metadata.Name+" advertise the same InternalIP", "recreate one APC node envelope before scheduling workloads")
+			} else {
+				internalIPOwners[address.Address] = node.Metadata.Name
+			}
 		}
 	}
 	if len(readyNodes) == 0 {

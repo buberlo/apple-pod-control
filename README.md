@@ -55,6 +55,7 @@ apc cluster doctor
 apc image sync docker.io/library/busybox:1.36.1 --peer user@mac-mini.local
 apc cluster backup lan-spike --output "$HOME/Backups/lan-spike.apcbackup"
 apc system install --role server --cluster lan-spike
+apc cluster network-policy enable lan-spike --yes
 ```
 
 APC owns cluster lifecycle and context selection. Kubernetes continues to own
@@ -75,6 +76,28 @@ Cluster lifecycle includes ownership-checked delete/remove, consistent offline
 volume backups, checksum-validated restore, digest-only upgrades with automatic
 rollback, and per-user launchd supervision. Destructive operations require an
 explicit `--yes`; `--keep-data` removes only the disposable VM envelope.
+
+New v2 clusters enable K3s NetworkPolicy enforcement by default. APC preserves
+each node's Kubernetes `InternalIP` across disposable Apple-VM replacement, and
+the policy controller has been exercised across consecutive server and agent
+restarts. The example Helm chart includes a same-namespace ingress policy,
+rolling updates, topology spread and an optional PodDisruptionBudget.
+
+For a two-Mac cluster, APC can validate, load and persist exact-peer macOS PF
+rules for the Kubernetes API, kubelet and Flannel VXLAN ports. Installation
+copies a root-owned helper and creates a root LaunchDaemon; it requires an
+interactive administrator authorization on each Mac:
+
+```bash
+apc system firewall render --cluster lan-spike --role server \
+  --interface en0 --local-ip SERVER_IP --peer AGENT_IP
+sudo apc system firewall install --cluster lan-spike --role server \
+  --interface en0 --local-ip SERVER_IP --peer AGENT_IP --yes
+```
+
+VXLAN is not encrypted. Use only a trusted LAN, or bind the cluster and PF rules
+to an authenticated host-overlay interface. Apple container 1.0's guest kernel
+does not support WireGuard-native Flannel.
 
 ## Requirements
 
@@ -119,7 +142,7 @@ The K3s version and multi-platform OCI image digest are pinned in code. The
 node runs ARM64 natively and uses VXLAN because Apple container 1.0's guest
 kernel does not provide a WireGuard interface. Kubernetes state lives on an
 APC-labelled Apple volume; `apc cluster start` recreates the lightweight VM
-envelope and reattaches that volume.
+envelope, reattaches that volume and retains a stable Kubernetes `InternalIP`.
 
 ## Local development smoke test
 

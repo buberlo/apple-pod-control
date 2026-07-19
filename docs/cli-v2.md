@@ -41,9 +41,9 @@ Common kubectl top-level commands are accepted directly, including `get`,
 `annotate`, `top`, `auth`, `debug`, `drain` and `cluster-info`.
 
 APC reserves only its lifecycle commands (`cluster`, `node`, `image`, `system`,
-`doctor`, `config`, `kubeconfig`, `kubectl` and `version`). Other top-level names are
-forwarded as well, allowing future kubectl commands and kubectl plugins without
-an APC release.
+`doctor`, `config`, `kubeconfig`, `kubectl` and `version`). Other top-level names
+are forwarded as well, allowing future kubectl commands and kubectl plugins
+without an APC release.
 
 Arguments are not interpreted by APC after cluster selection. Standard input,
 output and error are connected directly to kubectl, which keeps `-f -`,
@@ -160,6 +160,38 @@ apc system install --role agent --cluster lan-spike \
 The generated user LaunchAgent is restricted to launchd's Background session
 and invokes a long-running APC reconcile loop. It starts Apple's container
 service if needed and recreates a missing/stopped APC envelope from saved state.
+
+## Network policy and host firewall
+
+New clusters enable K3s's NetworkPolicy controller by default. Existing
+clusters can change it through a volume-preserving envelope replacement:
+
+```bash
+apc cluster network-policy enable lan-spike --yes
+```
+
+APC also renders peer-restricted PF rules before any privileged action. For a
+server Mac and one agent Mac:
+
+```bash
+apc system firewall render --cluster lan-spike --role server \
+  --interface en0 --local-ip SERVER_IP --peer AGENT_IP
+
+sudo apc system firewall install --cluster lan-spike --role server \
+  --interface en0 --local-ip SERVER_IP --peer AGENT_IP --yes
+
+# Reverse role and addresses on the agent Mac.
+sudo apc system firewall install --cluster lan-spike --role agent \
+  --interface en0 --local-ip AGENT_IP --peer SERVER_IP --yes
+```
+
+`render` runs `pfctl`'s parser but does not mutate the host. `install` copies a
+root-owned APC helper to `/Library/PrivilegedHelperTools`, writes a root
+LaunchDaemon and loads the `com.apple/apc/CLUSTER` anchor. Only the exact peers
+may reach server TCP 16443, node TCP 10250 and VXLAN UDP 8472. `firewall
+uninstall --yes` unloads the daemon, flushes the anchor and releases APC's PF
+reference. Use an encrypted overlay interface and its addresses instead of
+`en0` before operating across an untrusted network.
 
 ## APC v1 compatibility
 

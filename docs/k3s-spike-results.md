@@ -27,8 +27,10 @@ intentionally omitted.
 | Offline backup and restore | Pass | A ConfigMap changed after backup returned to its original value after checksum-validated restore |
 | Digest-only upgrade and rollback base | Pass | Server recreated from an alternate ARM64 manifest digest, retained data and reached Ready; pre-upgrade backup recorded |
 | launchd supervision | Pass | Background LaunchAgents ran on both Macs and reconciled server/agent without failures |
-| Dynamic private VM address | Pass | Boot wrapper set K3s `--node-ip`; Kubernetes updated `InternalIP` |
-| Full simultaneous restart/reconnect | Blocked by host runtime | MacBook Apple VMs lost all LAN/Internet routing while the host and Mac mini remained healthy |
+| Stable node identity across private VM address changes | Pass | Replacement VMs bound the saved Kubernetes `InternalIP`; both Nodes remained Ready without an address collision |
+| Kubernetes NetworkPolicy | Pass | Controller survived consecutive server/agent envelope replacements; cross-host default-deny and label-selected TCP allow both passed |
+| Peer-restricted macOS PF rules | Pass in implementation/validation | `pfctl` accepted server and agent rules; root-owned reboot persistence and reversible PF references are implemented |
+| Full simultaneous restart/reconnect | Pass | Both envelopes were stopped together; LaunchAgents recreated them, retained stable InternalIPs and returned both Nodes to Ready in about 15 seconds |
 | WireGuard-native Flannel | Unsupported | Apple container 1.0 guest kernel returned `operation not supported` |
 
 ## Runtime findings reflected in the implementation
@@ -41,8 +43,9 @@ intentionally omitted.
   DHCP lease or deterministic MAC.
 - `/var/lib/rancher/k3s` is stored on an APC-labelled 8 GiB Apple volume. Start
   recreates the lightweight VM envelope and reattaches the volume.
-- K3s's built-in network-policy controller is disabled because it crashed after
-  an `InternalIP` change. NetworkPolicy enforcement is not available yet.
+- APC retains each node's Kubernetes `InternalIP` as a secondary address when
+  Apple's replacement VM receives a different primary address. K3s's built-in
+  network-policy controller is enabled and restart-safe with that invariant.
 - Flannel VXLAN works across the two Macs while VM-to-LAN routing is healthy.
   Its traffic is unencrypted and suitable only for a trusted lab network.
 - The bidirectional cross-host Pod probe was repeated on 2026-07-18 and still
@@ -52,14 +55,14 @@ intentionally omitted.
 
 ## Remaining gates for a usable alpha
 
-1. Repeat automated cold-start and simultaneous-restart tests after restoring
-   the affected Mac's Apple-VM networking; run them in CI on two real Macs.
-2. Add host firewall management and a secure host overlay before leaving a
-   trusted LAN. Do not expose VXLAN directly to an untrusted network.
-3. Select a restart-safe CNI/network-policy implementation and re-enable
-   Kubernetes NetworkPolicy semantics.
+1. Add the simultaneous supervisor recovery gate to dedicated two-Mac hardware
+   CI; the manual real-hardware repetition now passes.
+2. Perform the explicit administrator-authorized PF LaunchDaemon installation
+   on both Macs. Rule rendering and parser validation are already complete.
+3. Add or configure an authenticated host overlay before leaving a trusted LAN;
+   do not expose unencrypted VXLAN directly to an untrusted network.
 4. Add three-server embedded-etcd HA. A two-node server/agent cluster is not
-   control-plane HA.
+   control-plane HA and cannot prove a three-fault-domain design.
 
 The kubectl-compatible APC frontend is now implemented. Additional Kubernetes
 verbs inherit their behavior from the installed native `kubectl`; APC does not
@@ -134,3 +137,29 @@ Finally, stable `~/.local/bin/apc` builds were installed on both Macs. The
 server and agent Background LaunchAgents are active in each user's headless-safe
 launchd domain, their supervisor logs are empty, and a follow-up deep doctor
 reported 16 passes, two intentionally skipped egress warnings and zero failures.
+
+## Stable-IP, NetworkPolicy and simultaneous recovery follow-up
+
+APC now records the first Kubernetes `InternalIP` for each server and agent.
+When Apple assigns a replacement VM a different primary private address, APC
+binds the recorded address as a secondary guest address and continues using it
+for K3s `--node-ip`. Server and agent replacements retained distinct stable
+addresses while their Apple primary addresses changed repeatedly.
+
+With that invariant, K3s's built-in NetworkPolicy controller started and
+completed full sync after every replacement. An isolated two-host test first
+denied both MacBook clients from an nginx Pod on the Mac mini, then allowed only
+the label-selected client on TCP 80 while the other remained denied.
+
+For the final crash gate, both Apple VM envelopes were stopped in the same test
+window. The two Background LaunchAgents created new server and agent envelopes,
+both Nodes returned to `Ready` in about 15 seconds, and their Kubernetes
+InternalIPs stayed unchanged. The post-recovery doctor reported 16 passes, two
+intentionally skipped public-egress warnings and zero failures. It covered
+CoreDNS, kubelet exec, both directed cross-host HTTP paths, ClusterIP routing
+and exact cleanup. The cross-host NetworkPolicy deny/allow test then passed
+again. Supervisor logs remained empty.
+
+The example Helm release was upgraded in place to include NetworkPolicy,
+rolling-update strategy, seccomp defaults and a PodDisruptionBudget. A live
+same-namespace BusyBox client retrieved the nginx page through the ClusterIP.

@@ -112,19 +112,25 @@ Apple container 1.0 behaviors that APC has to absorb:
 1. the private VM address can change even when a deterministic MAC is used;
 2. a port-published VM can lose outbound routing after restart.
 
-APC therefore resolves the private address inside every boot and passes it to
-K3s as `--node-ip`. K3s data is stored on an Apple named volume, while `start`
-recreates the disposable VM envelope instead of invoking `container start`.
-During the final test run, outbound routing from every Apple VM on the MacBook
-remained unavailable even after restarting the Apple container service, while
-the macOS host and the Mac mini VMs remained healthy. That host-runtime state
-currently prevents a repeatable post-restart cross-host pass and is not caused
-by K3s or Flannel. The detailed evidence is in
-[the spike report](../k3s-spike-results.md).
+APC therefore resolves the private address inside every boot. On first create
+it records that address as the Kubernetes `InternalIP`; replacement envelopes
+bind it as a secondary guest address and continue passing it to K3s as
+`--node-ip`, while Apple's new primary address remains available for NAT. K3s
+data is stored on an Apple named volume, while `start` recreates the disposable
+VM envelope instead of invoking `container start`.
+During an early restart run, outbound routing from every Apple VM on the
+MacBook remained unavailable even after restarting the Apple container service,
+while the macOS host and the Mac mini VMs remained healthy. Later recovery and
+simultaneous-restart runs passed both cross-host directions; the deep doctor is
+retained because the host-runtime failure can otherwise leave Kubernetes Nodes
+superficially `Ready`. The detailed evidence is in [the spike
+report](../k3s-spike-results.md).
 
-K3s's built-in network-policy controller also failed to reconcile a changed
-private VM address. It is disabled for the spike; production NetworkPolicy
-support requires a CNI/controller that passes the same restart test.
+K3s's built-in network-policy controller initially failed to reconcile a
+changed private VM address. Retaining the Kubernetes `InternalIP` removes that
+failure mode. The controller subsequently survived consecutive agent and
+server envelope replacements, and cross-host tests verified default-deny plus
+label-selected TCP ingress. New APC clusters therefore enable it by default.
 
 ## Security consequences
 
@@ -135,9 +141,12 @@ does not expose the macOS home directory to the node.
 
 The API defaults to loopback. LAN mode requires an explicit advertise address.
 Kubeconfig and join tokens are credentials and must remain mode `0600`, must
-never enter Git, and must not be printed in logs. UDP 8472 is unencrypted and
-must never be exposed to an untrusted network. Host firewall automation is a
-required follow-up before treating LAN mode as more than a lab feature.
+never enter Git, and must not be printed in logs. APC renders and persists a
+dedicated macOS PF anchor that restricts API, kubelet and VXLAN ports to exact
+cluster peers; privileged installation remains an explicit administrator
+action on every Mac. UDP 8472 is still unencrypted and must never be exposed to
+an untrusted network. A trusted LAN or authenticated host overlay remains a
+deployment requirement.
 
 ## Consequences
 

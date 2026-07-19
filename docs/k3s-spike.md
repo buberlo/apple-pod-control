@@ -38,7 +38,9 @@ port to its remotedialer clients.
 The create operation is idempotent. If the labelled node already exists, APC
 adopts or starts it and refreshes the kubeconfig. Successful create/start also
 selects the cluster as the active APC context, so subsequent Kubernetes
-workload commands use the short `apc get/apply/logs/exec/...` form.
+workload commands use the short `apc get/apply/logs/exec/...` form. New clusters
+enable K3s NetworkPolicy enforcement by default; use
+`--enable-network-policy=false` only for controlled diagnosis.
 
 ## Install the example web server with Helm
 
@@ -58,7 +60,9 @@ curl http://127.0.0.1:18081/
 
 This flow pulls `docker.io/library/nginx:alpine` through K3s's containerd. Any
 ARM64 or multi-architecture OCI image supported by Kubernetes can be configured
-in `examples/helm/web/values.yaml`.
+in `examples/helm/web/values.yaml`. The chart demonstrates rolling updates,
+topology spread, a same-namespace ingress NetworkPolicy and an optional
+PodDisruptionBudget.
 
 ## Lifecycle and diagnostics
 
@@ -109,6 +113,9 @@ On LAN clusters, `cluster start` detects a DHCP address change on the same host
 subnet, recreates K3s with the new external IP/TLS SAN, and rewrites kubeconfig.
 Agent configuration and the K3s node password are persisted so `apc node
 stop/start` can replace the Mini's disposable VM without losing its identity.
+APC also rebinds the saved Kubernetes `InternalIP` inside each replacement VM,
+which keeps Flannel and the NetworkPolicy controller restart-safe even if
+Apple's private primary address changes.
 
 ## LAN preparation for the Mac mini gate
 
@@ -176,12 +183,35 @@ helm upgrade --install web examples/helm/web \
 bin/apc get pods -o wide
 ```
 
-The current spike uses unencrypted Flannel VXLAN and must remain on a trusted
-LAN. K3s's built-in network-policy controller is disabled because it did not
-recover correctly when Apple container assigned a new private VM address;
-Kubernetes `NetworkPolicy` is therefore not enforced in this phase. See the
-[validation report](k3s-spike-results.md) for the complete acceptance matrix
-and remaining work.
+Install exact-peer host firewall rules after validating their rendered form.
+These are separate privileged actions on both Macs; do not pass credentials or
+join tokens on a command line:
+
+```bash
+# Server Mac
+bin/apc system firewall render --cluster lan-spike --role server \
+  --interface en0 --local-ip MACBOOK_LAN_ADDRESS --peer MAC_MINI_LAN_ADDRESS
+sudo bin/apc system firewall install --cluster lan-spike --role server \
+  --interface en0 --local-ip MACBOOK_LAN_ADDRESS \
+  --peer MAC_MINI_LAN_ADDRESS --yes
+
+# Agent Mac (run locally there)
+sudo "$HOME/.local/bin/apc" system firewall install \
+  --cluster lan-spike --role agent --interface en0 \
+  --local-ip MAC_MINI_LAN_ADDRESS --peer MACBOOK_LAN_ADDRESS --yes
+```
+
+The rules permit only listed peers to reach TCP 16443/10250 and UDP 8472 and
+survive reboot through a root-owned LaunchDaemon. NetworkPolicy enforcement is
+enabled and has passed default-deny plus selector-allow traffic across the two
+Macs and consecutive VM-envelope replacements.
+
+Flannel VXLAN itself remains unencrypted. Keep it on a trusted LAN, or use an
+authenticated host overlay and pass that interface/address consistently to
+cluster creation, node join and `system firewall install`. The Apple container
+1.0 guest kernel cannot run WireGuard-native Flannel. See the [validation
+report](k3s-spike-results.md) for the complete acceptance matrix and remaining
+work.
 
 When an APC v2 context is active, overlapping commands target Kubernetes. Use
 `bin/apc --legacy get pods` to explicitly address the APC v1 REST control plane.

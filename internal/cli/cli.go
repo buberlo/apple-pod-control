@@ -19,6 +19,7 @@ import (
 	"github.com/buberlo/apple-pod-control/internal/client"
 	"github.com/buberlo/apple-pod-control/internal/cluster"
 	"github.com/buberlo/apple-pod-control/internal/doctor"
+	"github.com/buberlo/apple-pod-control/internal/firewall"
 	"github.com/buberlo/apple-pod-control/internal/images"
 	"github.com/buberlo/apple-pod-control/internal/launchd"
 	"github.com/buberlo/apple-pod-control/internal/model"
@@ -69,8 +70,149 @@ func NewCommand(out, errOut io.Writer) *cobra.Command {
 
 func (o *options) systemCommand() *cobra.Command {
 	command := &cobra.Command{Use: "system", Short: "Manage APC node supervision on macOS"}
-	command.AddCommand(o.systemInstallCommand(), o.systemUninstallCommand(), o.systemStatusCommand(), o.systemSuperviseCommand())
+	command.AddCommand(o.systemInstallCommand(), o.systemUninstallCommand(), o.systemStatusCommand(), o.systemSuperviseCommand(), o.systemFirewallCommand())
 	return command
+}
+
+func (o *options) systemFirewallCommand() *cobra.Command {
+	command := &cobra.Command{Use: "firewall", Short: "Render or load peer-restricted macOS PF rules"}
+	command.AddCommand(o.systemFirewallRenderCommand(), o.systemFirewallApplyCommand(), o.systemFirewallRemoveCommand(), o.systemFirewallInstallCommand(), o.systemFirewallUninstallCommand())
+	return command
+}
+
+func (o *options) systemFirewallInstallCommand() *cobra.Command {
+	config := firewall.Config{Role: "server", Interface: "en0", APIPort: cluster.DefaultAPIPort, VXLANPort: cluster.DefaultVXLANPort, KubeletPort: cluster.DefaultKubeletPort}
+	var confirmed bool
+	var executable string
+	command := &cobra.Command{
+		Use:   "install",
+		Short: "Install and start a root-owned PF LaunchDaemon",
+		Args:  cobra.NoArgs,
+		RunE: func(command *cobra.Command, _ []string) error {
+			if !confirmed {
+				return fmt.Errorf("refusing privileged firewall installation without --yes")
+			}
+			config.Cluster = o.clusterName(nil)
+			if executable == "" {
+				resolved, err := os.Executable()
+				if err != nil {
+					return fmt.Errorf("resolve APC executable: %w", err)
+				}
+				executable = resolved
+			}
+			path, err := firewall.Install(command.Context(), config, executable)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(o.out, "firewall.apc.dev/%s installed at %s\n", config.Cluster, path)
+			return nil
+		},
+	}
+	bindFirewallFlags(command, &config)
+	command.Flags().StringVar(&executable, "executable", "", "APC executable to copy into the privileged helper directory")
+	command.Flags().BoolVar(&confirmed, "yes", false, "confirm privileged helper and LaunchDaemon installation")
+	return command
+}
+
+func (o *options) systemFirewallUninstallCommand() *cobra.Command {
+	var confirmed bool
+	command := &cobra.Command{
+		Use:   "uninstall",
+		Short: "Remove APC's PF LaunchDaemon and release its PF reference",
+		Args:  cobra.NoArgs,
+		RunE: func(command *cobra.Command, _ []string) error {
+			if !confirmed {
+				return fmt.Errorf("refusing privileged firewall removal without --yes")
+			}
+			name := o.clusterName(nil)
+			if err := firewall.Uninstall(command.Context(), name); err != nil {
+				return err
+			}
+			fmt.Fprintf(o.out, "firewall.apc.dev/%s uninstalled\n", name)
+			return nil
+		},
+	}
+	command.Flags().BoolVar(&confirmed, "yes", false, "confirm PF LaunchDaemon removal")
+	return command
+}
+
+func (o *options) systemFirewallRenderCommand() *cobra.Command {
+	config := firewall.Config{Role: "server", Interface: "en0", APIPort: cluster.DefaultAPIPort, VXLANPort: cluster.DefaultVXLANPort, KubeletPort: cluster.DefaultKubeletPort}
+	command := &cobra.Command{
+		Use:   "render",
+		Short: "Print and validate PF rules without loading them",
+		Args:  cobra.NoArgs,
+		RunE: func(command *cobra.Command, _ []string) error {
+			config.Cluster = o.clusterName(nil)
+			rules, err := firewall.Render(config)
+			if err != nil {
+				return err
+			}
+			if err := firewall.Validate(command.Context(), rules); err != nil {
+				return err
+			}
+			_, err = o.out.Write(rules)
+			return err
+		},
+	}
+	bindFirewallFlags(command, &config)
+	return command
+}
+
+func (o *options) systemFirewallApplyCommand() *cobra.Command {
+	config := firewall.Config{Role: "server", Interface: "en0", APIPort: cluster.DefaultAPIPort, VXLANPort: cluster.DefaultVXLANPort, KubeletPort: cluster.DefaultKubeletPort}
+	var confirmed bool
+	command := &cobra.Command{
+		Use:   "apply",
+		Short: "Load peer-restricted rules into APC's macOS PF anchor",
+		Args:  cobra.NoArgs,
+		RunE: func(command *cobra.Command, _ []string) error {
+			if !confirmed {
+				return fmt.Errorf("refusing host firewall reconfiguration without --yes")
+			}
+			config.Cluster = o.clusterName(nil)
+			if err := firewall.Apply(command.Context(), config); err != nil {
+				return err
+			}
+			fmt.Fprintf(o.out, "firewall.apc.dev/%s loaded for %s peers\n", config.Cluster, config.Role)
+			return nil
+		},
+	}
+	bindFirewallFlags(command, &config)
+	command.Flags().BoolVar(&confirmed, "yes", false, "confirm PF anchor replacement")
+	return command
+}
+
+func (o *options) systemFirewallRemoveCommand() *cobra.Command {
+	var confirmed bool
+	command := &cobra.Command{
+		Use:   "remove",
+		Short: "Flush APC's PF rules for one cluster",
+		Args:  cobra.NoArgs,
+		RunE: func(command *cobra.Command, _ []string) error {
+			if !confirmed {
+				return fmt.Errorf("refusing host firewall removal without --yes")
+			}
+			name := o.clusterName(nil)
+			if err := firewall.Remove(command.Context(), name); err != nil {
+				return err
+			}
+			fmt.Fprintf(o.out, "firewall.apc.dev/%s removed\n", name)
+			return nil
+		},
+	}
+	command.Flags().BoolVar(&confirmed, "yes", false, "confirm PF anchor removal")
+	return command
+}
+
+func bindFirewallFlags(command *cobra.Command, config *firewall.Config) {
+	command.Flags().StringVar(&config.Role, "role", "server", "node role: server or agent")
+	command.Flags().StringVar(&config.Interface, "interface", "en0", "trusted or encrypted host interface")
+	command.Flags().StringVar(&config.LocalIP, "local-ip", "", "this Mac's IPv4 address on the selected interface")
+	command.Flags().StringSliceVar(&config.Peers, "peer", nil, "allowed peer IPv4 address (repeatable)")
+	command.Flags().IntVar(&config.APIPort, "api-port", cluster.DefaultAPIPort, "published Kubernetes API port")
+	command.Flags().IntVar(&config.VXLANPort, "vxlan-port", cluster.DefaultVXLANPort, "published Flannel VXLAN port")
+	command.Flags().IntVar(&config.KubeletPort, "kubelet-port", cluster.DefaultKubeletPort, "published kubelet port")
 }
 
 func (o *options) systemInstallCommand() *cobra.Command {
@@ -278,8 +420,48 @@ func (o *options) doctorCommand() *cobra.Command {
 func (o *options) clusterCommand() *cobra.Command {
 	command := &cobra.Command{Use: "cluster", Short: "Manage Kubernetes clusters hosted by apple/container"}
 	command.AddCommand(
-		o.clusterCreateCommand(), o.clusterStatusCommand(), o.clusterDoctorCommand(), o.clusterStartCommand(), o.clusterStopCommand(), o.clusterDeleteCommand(), o.clusterBackupCommand(), o.clusterRestoreCommand(), o.clusterUpgradeCommand(), o.clusterWriteJoinTokenCommand(),
+		o.clusterCreateCommand(), o.clusterStatusCommand(), o.clusterDoctorCommand(), o.clusterStartCommand(), o.clusterStopCommand(), o.clusterDeleteCommand(), o.clusterBackupCommand(), o.clusterRestoreCommand(), o.clusterUpgradeCommand(), o.clusterNetworkPolicyCommand(), o.clusterWriteJoinTokenCommand(),
 	)
+	return command
+}
+
+func (o *options) clusterNetworkPolicyCommand() *cobra.Command {
+	var confirmed bool
+	var timeout time.Duration
+	command := &cobra.Command{
+		Use:   "network-policy (enable|disable) [NAME]",
+		Short: "Enable or disable Kubernetes NetworkPolicy enforcement",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(command *cobra.Command, args []string) error {
+			if !confirmed {
+				return fmt.Errorf("refusing server network reconfiguration without --yes")
+			}
+			enabled := false
+			switch args[0] {
+			case "enable":
+				enabled = true
+			case "disable":
+			default:
+				return fmt.Errorf("network-policy action must be enable or disable")
+			}
+			nameArgs := []string(nil)
+			if len(args) == 2 {
+				nameArgs = args[1:]
+			}
+			state, err := cluster.NewManager("container").SetNetworkPolicy(command.Context(), o.clusterName(nameArgs), enabled, timeout)
+			if err != nil {
+				return err
+			}
+			status := "disabled"
+			if enabled {
+				status = "enabled"
+			}
+			fmt.Fprintf(o.out, "networkpolicy.apc.dev/%s %s; node/%s Ready\n", state.Name, status, state.NodeName)
+			return nil
+		},
+	}
+	command.Flags().BoolVar(&confirmed, "yes", false, "confirm recreation of the server VM envelope")
+	command.Flags().DurationVar(&timeout, "wait", 2*time.Minute, "maximum time to wait for the recreated server")
 	return command
 }
 
@@ -425,7 +607,7 @@ func (o *options) clusterDoctorCommand() *cobra.Command {
 }
 
 func (o *options) clusterCreateCommand() *cobra.Command {
-	config := cluster.Config{DisableTraefik: true}
+	config := cluster.Config{DisableTraefik: true, EnableNetworkPolicy: true}
 	command := &cobra.Command{
 		Use:   "create [NAME]",
 		Short: "Create an isolated ARM64 K3s server node",
@@ -458,6 +640,7 @@ func (o *options) clusterCreateCommand() *cobra.Command {
 	command.Flags().DurationVar(&config.StartupTimeout, "wait", 2*time.Minute, "maximum time to wait for a Ready node")
 	command.Flags().StringVar(&config.KubeconfigPath, "kubeconfig", "", "kubeconfig destination")
 	command.Flags().BoolVar(&config.DisableTraefik, "disable-ingress", true, "disable bundled Traefik and ServiceLB during the spike")
+	command.Flags().BoolVar(&config.EnableNetworkPolicy, "enable-network-policy", true, "enable K3s NetworkPolicy enforcement")
 	return command
 }
 
