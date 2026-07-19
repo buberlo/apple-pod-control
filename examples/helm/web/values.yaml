@@ -1,0 +1,32 @@
+replicaCount: 1
+
+image:
+  repository: docker.io/library/nginx
+  tag: alpine
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 80
+
+networkPolicy:
+  enabled: true
+  allowFromAllNamespaces: false
+
+podDisruptionBudget:
+  enabled: false
+  maxUnavailable: 1
+
+topologySpread:
+  enabled: true
+  whenUnsatisfiable: ScheduleAnyway
+
+tolerations: []
+
+resources:
+  requests:
+    cpu: 25m
+    memory: 32Mi
+  limits:
+    cpu: 250m
+    memory: 128Mi

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: apc-web
+description: Minimal nginx web server used to validate APC's native Helm path
+type: application
+version: 0.2.0
+appVersion: "alpine"
