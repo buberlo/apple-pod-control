@@ -183,6 +183,8 @@ sudo apc system firewall install --cluster lan-spike --role server \
 # Reverse role and addresses on the agent Mac.
 sudo apc system firewall install --cluster lan-spike --role agent \
   --interface en0 --local-ip AGENT_IP --peer SERVER_IP --yes
+
+sudo apc system firewall status --cluster lan-spike
 ```
 
 `render` runs `pfctl`'s parser but does not mutate the host. `install` copies a
@@ -192,6 +194,56 @@ may reach server TCP 16443, node TCP 10250 and VXLAN UDP 8472. `firewall
 uninstall --yes` unloads the daemon, flushes the anchor and releases APC's PF
 reference. Use an encrypted overlay interface and its addresses instead of
 `en0` before operating across an untrusted network.
+
+`firewall status` verifies the root:wheel ownership and exact modes of the
+privileged helper, LaunchDaemon and PF reference token, validates the plist,
+checks the loaded system launchd service and requires a complete live PF anchor.
+`install` runs the same verification before reporting success and restores the
+previous daemon configuration if any step fails.
+
+### Authenticated host overlay
+
+APC does not accept or persist Tailscale authentication keys. Install and log in
+to Tailscale independently on each Mac, then validate the two identities and
+the actual macOS route before creating a cluster. APC consumes only the
+[official CLI's machine-readable status](https://tailscale.com/docs/reference/tailscale-cli?tab=macos):
+
+```bash
+apc system overlay check --provider tailscale --peer-ip PEER_TAILSCALE_IP
+```
+
+The check uses Tailscale's machine-readable status, requires both devices to be
+online, restricts addresses to `100.64.0.0/10`, discovers the local tunnel
+interface and confirms that the peer route uses that same interface. It never
+prints user identity, auth keys or the complete Tailscale status document.
+
+For a new secure cluster, use each Mac's Tailscale address consistently as its
+listen and advertise address and use the server's Tailscale address in the
+agent `--server-url`. Install PF with `--interface auto --local-ip
+LOCAL_TAILSCALE_IP`; the root LaunchDaemon resolves a potentially changing
+macOS `utun` interface from the stable local overlay address every time it
+reconciles:
+
+```bash
+apc cluster create secure \
+  --listen-address SERVER_TAILSCALE_IP \
+  --advertise-address SERVER_TAILSCALE_IP
+
+apc node join secure \
+  --server-url https://SERVER_TAILSCALE_IP:16443 \
+  --token-file PRIVATE_TOKEN_FILE \
+  --listen-address AGENT_TAILSCALE_IP \
+  --advertise-address AGENT_TAILSCALE_IP
+
+sudo apc system firewall install --cluster secure --role server \
+  --interface auto --local-ip SERVER_TAILSCALE_IP \
+  --peer AGENT_TAILSCALE_IP --yes
+```
+
+This profile transports APC's published K3s/VXLAN ports over the authenticated
+host overlay. It is distinct from K3s's [experimental in-guest `--vpn-auth`
+integration](https://docs.k3s.io/networking/distributed-multicloud) and avoids
+copying a provider join key into the Apple VM.
 
 ## APC v1 compatibility
 

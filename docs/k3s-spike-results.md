@@ -59,7 +59,8 @@ intentionally omitted.
    CI; the manual real-hardware repetition now passes.
 2. Perform the explicit administrator-authorized PF LaunchDaemon installation
    on both Macs. Rule rendering and parser validation are already complete.
-3. Add or configure an authenticated host overlay before leaving a trusted LAN;
+3. Install and authenticate the selected host overlay on both Macs, then run
+   APC's implemented identity/peer/route preflight and repeat the network gates;
    do not expose unencrypted VXLAN directly to an untrusted network.
 4. Add three-server embedded-etcd HA. A two-node server/agent cluster is not
    control-plane HA and cannot prove a three-fault-domain design.

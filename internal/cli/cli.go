@@ -23,6 +23,7 @@ import (
 	"github.com/buberlo/apple-pod-control/internal/images"
 	"github.com/buberlo/apple-pod-control/internal/launchd"
 	"github.com/buberlo/apple-pod-control/internal/model"
+	"github.com/buberlo/apple-pod-control/internal/overlay"
 )
 
 const Version = "v0.2.0-alpha.1"
@@ -70,13 +71,81 @@ func NewCommand(out, errOut io.Writer) *cobra.Command {
 
 func (o *options) systemCommand() *cobra.Command {
 	command := &cobra.Command{Use: "system", Short: "Manage APC node supervision on macOS"}
-	command.AddCommand(o.systemInstallCommand(), o.systemUninstallCommand(), o.systemStatusCommand(), o.systemSuperviseCommand(), o.systemFirewallCommand())
+	command.AddCommand(o.systemInstallCommand(), o.systemUninstallCommand(), o.systemStatusCommand(), o.systemSuperviseCommand(), o.systemFirewallCommand(), o.systemOverlayCommand())
+	return command
+}
+
+func (o *options) systemOverlayCommand() *cobra.Command {
+	command := &cobra.Command{Use: "overlay", Short: "Validate an authenticated host overlay for APC traffic"}
+	command.AddCommand(o.systemOverlayCheckCommand())
+	return command
+}
+
+func (o *options) systemOverlayCheckCommand() *cobra.Command {
+	config := overlay.Config{Provider: "tailscale", Interface: "auto"}
+	var outputFormat string
+	command := &cobra.Command{
+		Use:   "check",
+		Short: "Verify local Tailscale identity, online peer and exact host route",
+		Args:  cobra.NoArgs,
+		RunE: func(command *cobra.Command, _ []string) error {
+			status, err := overlay.NewChecker().Check(command.Context(), config)
+			if err != nil {
+				return err
+			}
+			switch outputFormat {
+			case "", "wide":
+				writer := tabwriter.NewWriter(o.out, 0, 4, 2, ' ', 0)
+				fmt.Fprintln(writer, "PROVIDER\tBACKEND\tINTERFACE\tLOCAL-IP\tPEER-IP\tPEER-ONLINE")
+				fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%t\n", status.Provider, status.BackendState, status.Interface, status.LocalIP, status.PeerIP, status.PeerOnline)
+				return writer.Flush()
+			case "json", "yaml":
+				return printObject(o.out, status, outputFormat)
+			default:
+				return fmt.Errorf("unsupported output format %q; use wide, json, or yaml", outputFormat)
+			}
+		},
+	}
+	command.Flags().StringVar(&config.Provider, "provider", "tailscale", "authenticated overlay provider")
+	command.Flags().StringVar(&config.Interface, "interface", "auto", "expected interface, or auto to resolve it from the local overlay IP")
+	command.Flags().StringVar(&config.LocalIP, "local-ip", "", "expected local Tailscale IPv4; auto-detected when omitted")
+	command.Flags().StringVar(&config.PeerIP, "peer-ip", "", "online peer Tailscale IPv4")
+	command.Flags().StringVarP(&outputFormat, "output", "o", "wide", "output format: wide, json, or yaml")
+	_ = command.MarkFlagRequired("peer-ip")
 	return command
 }
 
 func (o *options) systemFirewallCommand() *cobra.Command {
 	command := &cobra.Command{Use: "firewall", Short: "Render or load peer-restricted macOS PF rules"}
-	command.AddCommand(o.systemFirewallRenderCommand(), o.systemFirewallApplyCommand(), o.systemFirewallRemoveCommand(), o.systemFirewallInstallCommand(), o.systemFirewallUninstallCommand())
+	command.AddCommand(o.systemFirewallRenderCommand(), o.systemFirewallApplyCommand(), o.systemFirewallRemoveCommand(), o.systemFirewallInstallCommand(), o.systemFirewallUninstallCommand(), o.systemFirewallStatusCommand())
+	return command
+}
+
+func (o *options) systemFirewallStatusCommand() *cobra.Command {
+	var outputFormat string
+	command := &cobra.Command{
+		Use:   "status",
+		Short: "Verify APC's root-owned PF installation and loaded anchor",
+		Args:  cobra.NoArgs,
+		RunE: func(command *cobra.Command, _ []string) error {
+			status, err := firewall.Verify(command.Context(), o.clusterName(nil))
+			if err != nil {
+				return err
+			}
+			switch outputFormat {
+			case "", "wide":
+				writer := tabwriter.NewWriter(o.out, 0, 4, 2, ' ', 0)
+				fmt.Fprintln(writer, "CLUSTER\tDAEMON\tANCHOR\tRULES\tPF-REFERENCE")
+				fmt.Fprintf(writer, "%s\t%s\t%s\t%d\t%t\n", status.Cluster, status.DaemonLabel, status.Anchor, status.RuleCount, status.ReferenceSet)
+				return writer.Flush()
+			case "json", "yaml":
+				return printObject(o.out, status, outputFormat)
+			default:
+				return fmt.Errorf("unsupported output format %q; use wide, json, or yaml", outputFormat)
+			}
+		},
+	}
+	command.Flags().StringVarP(&outputFormat, "output", "o", "wide", "output format: wide, json, or yaml")
 	return command
 }
 
@@ -207,7 +276,7 @@ func (o *options) systemFirewallRemoveCommand() *cobra.Command {
 
 func bindFirewallFlags(command *cobra.Command, config *firewall.Config) {
 	command.Flags().StringVar(&config.Role, "role", "server", "node role: server or agent")
-	command.Flags().StringVar(&config.Interface, "interface", "en0", "trusted or encrypted host interface")
+	command.Flags().StringVar(&config.Interface, "interface", "en0", "trusted/encrypted host interface, or auto to resolve it from --local-ip")
 	command.Flags().StringVar(&config.LocalIP, "local-ip", "", "this Mac's IPv4 address on the selected interface")
 	command.Flags().StringSliceVar(&config.Peers, "peer", nil, "allowed peer IPv4 address (repeatable)")
 	command.Flags().IntVar(&config.APIPort, "api-port", cluster.DefaultAPIPort, "published Kubernetes API port")

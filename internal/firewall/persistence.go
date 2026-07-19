@@ -11,12 +11,23 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 const (
 	helperPath      = "/Library/PrivilegedHelperTools/dev.apc.firewall"
 	launchDaemonDir = "/Library/LaunchDaemons"
 )
+
+type InstallationStatus struct {
+	Cluster      string `json:"cluster" yaml:"cluster"`
+	Anchor       string `json:"anchor" yaml:"anchor"`
+	DaemonLabel  string `json:"daemonLabel" yaml:"daemonLabel"`
+	PlistPath    string `json:"plistPath" yaml:"plistPath"`
+	HelperPath   string `json:"helperPath" yaml:"helperPath"`
+	RuleCount    int    `json:"ruleCount" yaml:"ruleCount"`
+	ReferenceSet bool   `json:"referenceSet" yaml:"referenceSet"`
+}
 
 func Install(ctx context.Context, config Config, executable string) (string, error) {
 	config, err := normalize(config)
@@ -83,7 +94,76 @@ func Install(ctx context.Context, config Config, executable string) (string, err
 	if err := Apply(ctx, config); err != nil {
 		return "", rollback(err)
 	}
+	if _, err := Verify(ctx, config.Cluster); err != nil {
+		_ = Remove(ctx, config.Cluster)
+		return "", rollback(err)
+	}
 	return plistPath, nil
+}
+
+func Verify(ctx context.Context, cluster string) (InstallationStatus, error) {
+	status := InstallationStatus{
+		Cluster: cluster, Anchor: anchorName(cluster), DaemonLabel: label(cluster),
+		PlistPath: daemonPath(cluster), HelperPath: helperPath,
+	}
+	if !safeCluster.MatchString(cluster) {
+		return status, fmt.Errorf("cluster name must be a lowercase DNS label")
+	}
+	if os.Geteuid() != 0 {
+		return status, fmt.Errorf("verifying the PF installation requires root; rerun this exact command with sudo")
+	}
+	if err := verifyRootFile(helperPath, 0o755); err != nil {
+		return status, fmt.Errorf("verify privileged helper: %w", err)
+	}
+	if err := verifyRootFile(status.PlistPath, 0o644); err != nil {
+		return status, fmt.Errorf("verify PF LaunchDaemon: %w", err)
+	}
+	plist, err := os.ReadFile(status.PlistPath)
+	if err != nil {
+		return status, fmt.Errorf("read PF LaunchDaemon: %w", err)
+	}
+	for _, required := range []string{helperPath, label(cluster), "<string>firewall</string>", "<string>apply</string>", "<string>--yes</string>"} {
+		if !bytes.Contains(plist, []byte(required)) {
+			return status, fmt.Errorf("PF LaunchDaemon is missing required value %q", required)
+		}
+	}
+	if _, err := runCommand(ctx, "/usr/bin/plutil", "validate PF LaunchDaemon", "-lint", status.PlistPath); err != nil {
+		return status, err
+	}
+	if _, err := runLaunchctl(ctx, "print", serviceTarget(cluster)); err != nil {
+		return status, err
+	}
+	rules, err := runCommand(ctx, "/sbin/pfctl", "read APC PF anchor", "-a", status.Anchor, "-sr")
+	if err != nil {
+		return status, err
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(rules)), "\n") {
+		if strings.TrimSpace(line) != "" {
+			status.RuleCount++
+		}
+	}
+	if status.RuleCount < 4 || !bytes.Contains(rules, []byte("pass in quick")) || !bytes.Contains(rules, []byte("block")) {
+		return status, fmt.Errorf("PF anchor %q does not contain APC's complete allow/block rules", status.Anchor)
+	}
+	if err := verifyRootFile(tokenPath(cluster), 0o600); err != nil {
+		return status, fmt.Errorf("verify PF reference token: %w", err)
+	}
+	token, err := os.ReadFile(tokenPath(cluster))
+	if err != nil {
+		return status, fmt.Errorf("read PF reference token: %w", err)
+	}
+	if !safeToken(string(token)) {
+		return status, fmt.Errorf("PF reference token is invalid")
+	}
+	references, err := runCommand(ctx, "/sbin/pfctl", "read PF references", "-s", "References")
+	if err != nil {
+		return status, err
+	}
+	if !referenceContains(string(references), strings.TrimSpace(string(token))) {
+		return status, fmt.Errorf("PF reference token is not held by the running packet filter")
+	}
+	status.ReferenceSet = true
+	return status, nil
 }
 
 func Uninstall(ctx context.Context, cluster string) error {
@@ -136,6 +216,8 @@ func RenderLaunchDaemon(config Config) []byte {
 	output.WriteString(`  </array>
   <key>RunAtLoad</key>
   <true/>
+  <key>StartInterval</key>
+  <integer>30</integer>
   <key>ProcessType</key>
   <string>Background</string>
 </dict>
@@ -207,14 +289,36 @@ func writeAtomic(path string, data []byte, mode os.FileMode) error {
 }
 
 func runLaunchctl(ctx context.Context, arguments ...string) ([]byte, error) {
-	command := exec.CommandContext(ctx, "/bin/launchctl", arguments...)
+	return runCommand(ctx, "/bin/launchctl", "configure PF LaunchDaemon", arguments...)
+}
+
+func runCommand(ctx context.Context, binary, operation string, arguments ...string) ([]byte, error) {
+	command := exec.CommandContext(ctx, binary, arguments...)
 	var output bytes.Buffer
 	command.Stdout = &output
 	command.Stderr = &output
 	if err := command.Run(); err != nil {
-		return output.Bytes(), commandError("configure PF LaunchDaemon", output.Bytes(), err)
+		return output.Bytes(), commandError(operation, output.Bytes(), err)
 	}
 	return output.Bytes(), nil
+}
+
+func verifyRootFile(path string, expectedMode os.FileMode) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", path)
+	}
+	if info.Mode().Perm() != expectedMode {
+		return fmt.Errorf("%s has mode %04o, expected %04o", path, info.Mode().Perm(), expectedMode)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != 0 || stat.Gid != 0 {
+		return fmt.Errorf("%s must be owned by root:wheel", path)
+	}
+	return nil
 }
 
 func daemonPath(cluster string) string {

@@ -99,6 +99,11 @@ VXLAN is not encrypted. Use only a trusted LAN, or bind the cluster and PF rules
 to an authenticated host-overlay interface. Apple container 1.0's guest kernel
 does not support WireGuard-native Flannel.
 
+`apc system overlay check --peer-ip PEER_TAILSCALE_IP` validates an independently
+authenticated Tailscale host path without accepting an auth key. PF supports
+`--interface auto`, so its reboot reconciler can resolve macOS's current `utun`
+name from the stable local overlay IP.
+
 ## Requirements
 
 - Control plane/CLI: Go 1.25 or newer
