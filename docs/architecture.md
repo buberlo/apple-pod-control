@@ -1,12 +1,30 @@
 # Architecture
 
-Apple Pod Control (APC) is a deliberately small, Kubernetes-inspired control
-plane for a trusted fleet of Apple Silicon Macs. It does not embed Kubernetes;
-it borrows the parts operators value most: a declarative API, an `apply`-based
-workflow, labels and selectors, reconciliation, scheduling, probes,
-self-healing, rolling updates, namespaces, and familiar resource views.
+Apple Pod Control (APC) has two intentionally separated generations. APC v1 is
+the deliberately small Kubernetes-inspired control plane described below. APC
+v2 runs upstream Kubernetes semantics through K3s and keeps custom code focused
+on Apple host lifecycle, image transport, recovery and diagnostics. New cluster
+work targets v2; v1 remains available through `apc --legacy`.
 
 ## High-level diagram
+
+APC v2 follows the Kubernetes control-plane boundary rather than reimplementing
+its APIs:
+
+```text
+ apc / kubectl / Helm ── kubeconfig ──> K3s API, controllers, scheduler, SQLite
+                                                │
+                         ┌──────────────────────┴──────────────────────┐
+                         v                                             v
+              Apple VM: K3s server                         Apple VM: K3s agent
+              MacBook + named volume                       Mac mini + named volume
+                         └──────── Flannel VXLAN / kubelet ────────────┘
+
+ APC lifecycle: labelled volumes, backup/restore, digest upgrade, image sync,
+                deep doctor and Background LaunchAgent supervision
+```
+
+The original v1 component model remains:
 
 ```text
                      HTTPS / Kubernetes-shaped JSON
@@ -106,7 +124,9 @@ The default local-development mode is plaintext. A LAN deployment should use:
 - TLS 1.3 on REST and gRPC (`--tls-cert`, `--tls-key`);
 - a private CA plus `--client-ca` for agent mutual TLS;
 - an `APC_TOKEN` bearer token for `apc` REST access;
-- a dedicated macOS user and LaunchAgent/LaunchDaemon for `apc-agent`.
+- a dedicated macOS user and Background LaunchAgent for each APC v2 node;
+- a LaunchDaemon and dedicated service account for unattended multi-user or
+  production-style v1 agents.
 
 Environment variables in this MVP are stored in plaintext. Do not put secrets
 there; a Secret API with encrypted-at-rest values is a follow-up.

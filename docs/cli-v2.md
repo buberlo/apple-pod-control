@@ -40,8 +40,8 @@ Common kubectl top-level commands are accepted directly, including `get`,
 `run`, `expose`, `rollout`, `scale`, `set`, `wait`, `patch`, `edit`, `label`,
 `annotate`, `top`, `auth`, `debug`, `drain` and `cluster-info`.
 
-APC reserves only its lifecycle commands (`cluster`, `node`, `doctor`,
-`config`, `kubeconfig`, `kubectl` and `version`). Other top-level names are
+APC reserves only its lifecycle commands (`cluster`, `node`, `image`, `system`,
+`doctor`, `config`, `kubeconfig`, `kubectl` and `version`). Other top-level names are
 forwarded as well, allowing future kubectl commands and kubectl plugins without
 an APC release.
 
@@ -117,6 +117,49 @@ remote Mac. `--pull=false` reuses the host cache.
 Image references, cluster names, platforms and SSH peers are validated before
 constructing commands. Sync targets the persistent K3s data volumes, so images
 remain available when APC replaces the surrounding Apple VM.
+
+## Lifecycle, backup and upgrades
+
+```bash
+apc cluster stop lan-spike
+apc cluster start lan-spike
+apc cluster delete lan-spike --keep-data --yes
+apc cluster start lan-spike
+
+apc cluster backup lan-spike --output "$HOME/Backups/lan-spike.apcbackup"
+apc cluster restore lan-spike --from "$HOME/Backups/lan-spike.apcbackup" --yes
+apc cluster upgrade lan-spike \
+  --image docker.io/rancher/k3s@sha256:DIGEST \
+  --yes
+```
+
+APC checks exact `managed`, `cluster` and `role` labels before stopping or
+deleting any Apple container or volume. Full deletion and restore require
+`--yes`; `--keep-data` retains both the data volume and enough configuration
+for `start` to recover a missing VM envelope.
+
+Backups are private `0700` directories containing `volume.tar` and a manifest.
+The server is stopped during the stream for a consistent SQLite and filesystem
+snapshot, then returned to its previous running state. Restore verifies the
+manifest, SHA-256 checksum, cluster identity and tar paths before stopping the
+server. Upgrades require immutable OCI digests, always make a backup and use it
+for automatic rollback when the replacement node fails readiness.
+
+On each Mac, install the reboot/crash supervisor from a stable binary path:
+
+```bash
+apc system install --role server --cluster lan-spike \
+  --executable "$HOME/.local/bin/apc"
+apc system status --role server --cluster lan-spike
+
+# On an agent Mac:
+apc system install --role agent --cluster lan-spike \
+  --executable "$HOME/.local/bin/apc"
+```
+
+The generated user LaunchAgent is restricted to launchd's Background session
+and invokes a long-running APC reconcile loop. It starts Apple's container
+service if needed and recreates a missing/stopped APC envelope from saved state.
 
 ## APC v1 compatibility
 

@@ -20,6 +20,7 @@ import (
 	"github.com/buberlo/apple-pod-control/internal/cluster"
 	"github.com/buberlo/apple-pod-control/internal/doctor"
 	"github.com/buberlo/apple-pod-control/internal/images"
+	"github.com/buberlo/apple-pod-control/internal/launchd"
 	"github.com/buberlo/apple-pod-control/internal/model"
 )
 
@@ -61,8 +62,121 @@ func NewCommand(out, errOut io.Writer) *cobra.Command {
 	command.AddCommand(
 		options.applyCommand(), options.getCommand(), options.describeCommand(), options.deleteCommand(),
 		options.rolloutCommand(), options.scaleCommand(), options.versionCommand(), options.doctorCommand(),
-		options.clusterCommand(), options.nodeCommand(), options.imageCommand(), options.configCommand(), options.kubeconfigCommand(), options.kubectlCommand(),
+		options.clusterCommand(), options.nodeCommand(), options.imageCommand(), options.systemCommand(), options.configCommand(), options.kubeconfigCommand(), options.kubectlCommand(),
 	)
+	return command
+}
+
+func (o *options) systemCommand() *cobra.Command {
+	command := &cobra.Command{Use: "system", Short: "Manage APC node supervision on macOS"}
+	command.AddCommand(o.systemInstallCommand(), o.systemUninstallCommand(), o.systemStatusCommand(), o.systemSuperviseCommand())
+	return command
+}
+
+func (o *options) systemInstallCommand() *cobra.Command {
+	config := launchd.Config{Role: "server", Interval: 15 * time.Second}
+	command := &cobra.Command{
+		Use:   "install",
+		Short: "Install and start a per-user APC LaunchAgent",
+		Args:  cobra.NoArgs,
+		RunE: func(command *cobra.Command, _ []string) error {
+			config.Cluster = o.clusterName(nil)
+			if config.Executable == "" {
+				executable, err := os.Executable()
+				if err != nil {
+					return fmt.Errorf("resolve APC executable: %w", err)
+				}
+				config.Executable = executable
+			}
+			manager, err := launchd.NewManager()
+			if err != nil {
+				return err
+			}
+			path, err := manager.Install(command.Context(), config)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(o.out, "launchagent.apc.dev/%s-%s installed at %s\n", config.Role, config.Cluster, path)
+			return nil
+		},
+	}
+	command.Flags().StringVar(&config.Role, "role", "server", "node role: server or agent")
+	command.Flags().StringVar(&config.Executable, "executable", "", "stable APC executable path; defaults to the current binary")
+	command.Flags().DurationVar(&config.Interval, "interval", 15*time.Second, "health reconciliation interval")
+	return command
+}
+
+func (o *options) systemUninstallCommand() *cobra.Command {
+	config := launchd.Config{Role: "server", Interval: 15 * time.Second}
+	command := &cobra.Command{
+		Use:   "uninstall",
+		Short: "Stop and remove a per-user APC LaunchAgent",
+		Args:  cobra.NoArgs,
+		RunE: func(command *cobra.Command, _ []string) error {
+			config.Cluster = o.clusterName(nil)
+			executable, err := os.Executable()
+			if err != nil {
+				return fmt.Errorf("resolve APC executable: %w", err)
+			}
+			config.Executable = executable
+			manager, err := launchd.NewManager()
+			if err != nil {
+				return err
+			}
+			if err := manager.Uninstall(command.Context(), config); err != nil {
+				return err
+			}
+			fmt.Fprintf(o.out, "launchagent.apc.dev/%s-%s removed\n", config.Role, config.Cluster)
+			return nil
+		},
+	}
+	command.Flags().StringVar(&config.Role, "role", "server", "node role: server or agent")
+	return command
+}
+
+func (o *options) systemStatusCommand() *cobra.Command {
+	config := launchd.Config{Role: "server", Interval: 15 * time.Second}
+	command := &cobra.Command{
+		Use:   "status",
+		Short: "Show launchd state for an APC node supervisor",
+		Args:  cobra.NoArgs,
+		RunE: func(command *cobra.Command, _ []string) error {
+			config.Cluster = o.clusterName(nil)
+			executable, err := os.Executable()
+			if err != nil {
+				return fmt.Errorf("resolve APC executable: %w", err)
+			}
+			config.Executable = executable
+			manager, err := launchd.NewManager()
+			if err != nil {
+				return err
+			}
+			status, err := manager.Status(command.Context(), config)
+			if err != nil {
+				return err
+			}
+			_, err = o.out.Write(status)
+			return err
+		},
+	}
+	command.Flags().StringVar(&config.Role, "role", "server", "node role: server or agent")
+	return command
+}
+
+func (o *options) systemSuperviseCommand() *cobra.Command {
+	config := cluster.SuperviseOptions{Role: "server", Interval: 15 * time.Second, Output: o.out}
+	command := &cobra.Command{
+		Use:    "supervise",
+		Short:  "Continuously reconcile one local APC node",
+		Hidden: true,
+		Args:   cobra.NoArgs,
+		RunE: func(command *cobra.Command, _ []string) error {
+			config.Name = o.clusterName(nil)
+			return cluster.NewManager("container").Supervise(command.Context(), config)
+		},
+	}
+	command.Flags().StringVar(&config.Role, "role", "server", "node role: server or agent")
+	command.Flags().DurationVar(&config.Interval, "interval", 15*time.Second, "health reconciliation interval")
 	return command
 }
 
@@ -164,8 +278,111 @@ func (o *options) doctorCommand() *cobra.Command {
 func (o *options) clusterCommand() *cobra.Command {
 	command := &cobra.Command{Use: "cluster", Short: "Manage Kubernetes clusters hosted by apple/container"}
 	command.AddCommand(
-		o.clusterCreateCommand(), o.clusterStatusCommand(), o.clusterDoctorCommand(), o.clusterStartCommand(), o.clusterStopCommand(), o.clusterWriteJoinTokenCommand(),
+		o.clusterCreateCommand(), o.clusterStatusCommand(), o.clusterDoctorCommand(), o.clusterStartCommand(), o.clusterStopCommand(), o.clusterDeleteCommand(), o.clusterBackupCommand(), o.clusterRestoreCommand(), o.clusterUpgradeCommand(), o.clusterWriteJoinTokenCommand(),
 	)
+	return command
+}
+
+func (o *options) clusterUpgradeCommand() *cobra.Command {
+	var image, backupPath string
+	var confirmed bool
+	command := &cobra.Command{
+		Use:   "upgrade [NAME] --image IMAGE@sha256:DIGEST",
+		Short: "Upgrade a K3s server with automatic backup and rollback",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(command *cobra.Command, args []string) error {
+			if !confirmed {
+				return fmt.Errorf("refusing cluster upgrade without --yes")
+			}
+			result, err := cluster.NewManager("container").UpgradeServer(command.Context(), o.clusterName(args), image, backupPath)
+			if err != nil {
+				return err
+			}
+			if !result.Changed {
+				fmt.Fprintf(o.out, "cluster.apc.dev/%s already uses %s\n", result.State.Name, result.ToImage)
+				return nil
+			}
+			fmt.Fprintf(o.out, "cluster.apc.dev/%s upgraded and Ready (%s)\n", result.State.Name, result.State.K3sVersion)
+			fmt.Fprintf(o.out, "rollback backup: %s\n", result.BackupPath)
+			return nil
+		},
+	}
+	command.Flags().StringVar(&image, "image", "", "immutable ARM64 K3s OCI image digest")
+	command.Flags().StringVar(&backupPath, "backup", "", "pre-upgrade backup directory; defaults to APC's private backup root")
+	command.Flags().BoolVar(&confirmed, "yes", false, "confirm the server image replacement")
+	_ = command.MarkFlagRequired("image")
+	return command
+}
+
+func (o *options) clusterBackupCommand() *cobra.Command {
+	var output string
+	command := &cobra.Command{
+		Use:   "backup [NAME] --output DIRECTORY",
+		Short: "Create a consistent offline backup of a K3s server volume",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(command *cobra.Command, args []string) error {
+			result, err := cluster.NewManager("container").BackupServer(command.Context(), o.clusterName(args), output)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(o.out, "backup.apc.dev created at %s (%s, sha256:%s)\n", result.Path, byteSize(result.Bytes), result.DataSHA256)
+			return nil
+		},
+	}
+	command.Flags().StringVarP(&output, "output", "o", "", "new private directory that will contain the backup")
+	_ = command.MarkFlagRequired("output")
+	return command
+}
+
+func (o *options) clusterRestoreCommand() *cobra.Command {
+	var input string
+	var confirmed bool
+	command := &cobra.Command{
+		Use:   "restore [NAME] --from DIRECTORY",
+		Short: "Replace a K3s server volume with a validated APC backup",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(command *cobra.Command, args []string) error {
+			if !confirmed {
+				return fmt.Errorf("refusing destructive cluster restore without --yes")
+			}
+			state, err := cluster.NewManager("container").RestoreServer(command.Context(), o.clusterName(args), input)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(o.out, "cluster.apc.dev/%s restored and Ready (%s)\n", state.Name, state.K3sVersion)
+			return nil
+		},
+	}
+	command.Flags().StringVar(&input, "from", "", "APC backup directory")
+	command.Flags().BoolVar(&confirmed, "yes", false, "confirm replacement of the current server data")
+	_ = command.MarkFlagRequired("from")
+	return command
+}
+
+func (o *options) clusterDeleteCommand() *cobra.Command {
+	var confirmed, keepData bool
+	command := &cobra.Command{
+		Use:   "delete [NAME]",
+		Short: "Delete an APC K3s server and, by default, its data",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(command *cobra.Command, args []string) error {
+			if !confirmed {
+				return fmt.Errorf("refusing destructive cluster deletion without --yes")
+			}
+			name := o.clusterName(args)
+			if err := cluster.NewManager("container").DeleteServer(command.Context(), name, keepData); err != nil {
+				return err
+			}
+			if keepData {
+				fmt.Fprintf(o.out, "cluster.apc.dev/%s VM removed; data retained\n", name)
+			} else {
+				fmt.Fprintf(o.out, "cluster.apc.dev/%s deleted\n", name)
+			}
+			return nil
+		},
+	}
+	command.Flags().BoolVar(&confirmed, "yes", false, "confirm deletion without an interactive prompt")
+	command.Flags().BoolVar(&keepData, "keep-data", false, "retain the APC data volume and saved configuration")
 	return command
 }
 
@@ -329,7 +546,34 @@ func (o *options) clusterWriteJoinTokenCommand() *cobra.Command {
 
 func (o *options) nodeCommand() *cobra.Command {
 	command := &cobra.Command{Use: "node", Short: "Manage K3s worker nodes on this Mac"}
-	command.AddCommand(o.nodeJoinCommand(), o.nodeStatusCommand(), o.nodeStartCommand(), o.nodeStopCommand())
+	command.AddCommand(o.nodeJoinCommand(), o.nodeStatusCommand(), o.nodeStartCommand(), o.nodeStopCommand(), o.nodeRemoveCommand())
+	return command
+}
+
+func (o *options) nodeRemoveCommand() *cobra.Command {
+	var confirmed, keepData bool
+	command := &cobra.Command{
+		Use:   "remove [CLUSTER]",
+		Short: "Remove the local K3s agent and, by default, its data",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(command *cobra.Command, args []string) error {
+			if !confirmed {
+				return fmt.Errorf("refusing destructive node removal without --yes")
+			}
+			name := o.clusterName(args)
+			if err := cluster.NewManager("container").DeleteAgent(command.Context(), name, keepData); err != nil {
+				return err
+			}
+			if keepData {
+				fmt.Fprintf(o.out, "node.apc.dev/%s VM removed; data retained\n", name)
+			} else {
+				fmt.Fprintf(o.out, "node.apc.dev/%s removed\n", name)
+			}
+			return nil
+		},
+	}
+	command.Flags().BoolVar(&confirmed, "yes", false, "confirm removal without an interactive prompt")
+	command.Flags().BoolVar(&keepData, "keep-data", false, "retain the APC data volume and saved configuration")
 	return command
 }
 

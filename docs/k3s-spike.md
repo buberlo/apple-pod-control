@@ -68,6 +68,12 @@ bin/apc cluster doctor spike
 bin/apc image prefetch docker.io/library/busybox:1.36.1
 bin/apc cluster stop spike
 bin/apc cluster start spike
+bin/apc cluster backup spike --output "$HOME/Backups/spike.apcbackup"
+bin/apc cluster restore spike --from "$HOME/Backups/spike.apcbackup" --yes
+
+# Install crash/reboot supervision for this Mac:
+bin/apc system install --role server --cluster spike \
+  --executable "$HOME/.local/bin/apc"
 
 # Bootstrap convenience when host kubectl is not installed:
 bin/apc kubectl spike -- get pods -A
@@ -82,8 +88,22 @@ bin/apc config current-cluster
 stopped envelope, creates a fresh one and reattaches the labelled Apple volume
 that contains `/var/lib/rancher/k3s`. This preserves Kubernetes and Helm state
 while avoiding an Apple container 1.0 issue where a directly restarted,
-port-published VM can lose outbound connectivity. Destructive cluster deletion
-is deliberately not part of this first spike command set.
+port-published VM can lose outbound connectivity.
+
+`cluster delete --yes` removes only containers and volumes carrying the exact
+APC ownership labels. `--keep-data` retains the volume and saved configuration;
+a later `cluster start` recreates the missing envelope. `node remove` provides
+the equivalent behavior for an agent. Backups stop a running server, mount its
+volume into a pinned ARM64 BusyBox helper, stream a private tar archive, record
+its SHA-256 digest and return the server to Ready. Restore validates the
+checksum and archive paths before replacing any data. `cluster upgrade` accepts
+only immutable SHA-256 image references, creates a pre-upgrade backup and
+automatically restores it if the replacement server does not become Ready.
+
+`system install` creates a Background LaunchAgent in the per-user launchd
+domain. Its long-running supervisor reconciles Apple's container service and
+the selected APC server or agent every 15 seconds. Use `system status` and
+`system uninstall` with the same `--role` and `--cluster` values.
 
 On LAN clusters, `cluster start` detects a DHCP address change on the same host
 subnet, recreates K3s with the new external IP/TLS SAN, and rewrites kubeconfig.
@@ -136,6 +156,11 @@ container system start
   --token-file "$HOME/Library/Application Support/apc/clusters/lan-spike/agent-token" \
   --node-name apc-macmini \
   --advertise-address MAC_MINI_LAN_ADDRESS
+
+"$HOME/.local/bin/apc" system install \
+  --role agent \
+  --cluster lan-spike \
+  --executable "$HOME/.local/bin/apc"
 ```
 
 Then validate from the server Mac:

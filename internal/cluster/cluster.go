@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	neturl "net/url"
 	"os"
@@ -88,6 +89,10 @@ type commandRunner interface {
 	Run(context.Context, string, ...string) ([]byte, []byte, error)
 }
 
+type streamCommandRunner interface {
+	RunIO(context.Context, string, []string, io.Reader, io.Writer, io.Writer) error
+}
+
 type execRunner struct{}
 
 func (execRunner) Run(ctx context.Context, binary string, arguments ...string) ([]byte, []byte, error) {
@@ -99,9 +104,18 @@ func (execRunner) Run(ctx context.Context, binary string, arguments ...string) (
 	return stdout.Bytes(), stderr.Bytes(), err
 }
 
+func (execRunner) RunIO(ctx context.Context, binary string, arguments []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	command := exec.CommandContext(ctx, binary, arguments...)
+	command.Stdin = stdin
+	command.Stdout = stdout
+	command.Stderr = stderr
+	return command.Run()
+}
+
 type Manager struct {
 	binary  string
 	runner  commandRunner
+	stream  streamCommandRunner
 	dialTCP func(context.Context, string) error
 }
 
@@ -119,6 +133,7 @@ func NewManager(binary string) *Manager {
 	return &Manager{
 		binary: binary,
 		runner: execRunner{},
+		stream: execRunner{},
 		dialTCP: func(ctx context.Context, address string) error {
 			connection, err := (&net.Dialer{}).DialContext(ctx, "tcp", address)
 			if err != nil {
@@ -278,11 +293,13 @@ func (m *Manager) StartAgent(ctx context.Context, name string, timeout time.Dura
 		return State{}, err
 	}
 	record, err := m.inspect(ctx, AgentContainerName(name))
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrNotFound) {
 		return State{}, err
 	}
-	if err := validateOwnedContainer(record, name, "agent"); err != nil {
-		return State{}, err
+	if err == nil {
+		if err := validateOwnedContainer(record, name, "agent"); err != nil {
+			return State{}, err
+		}
 	}
 	if addressChanged && strings.EqualFold(record.Status.State, "running") {
 		if _, stderr, stopErr := m.runner.Run(ctx, m.binary, "stop", AgentContainerName(name)); stopErr != nil {
@@ -290,12 +307,14 @@ func (m *Manager) StartAgent(ctx context.Context, name string, timeout time.Dura
 		}
 		record.Status.State = "stopped"
 	}
-	if strings.EqualFold(record.Status.State, "stopped") {
+	if errors.Is(err, ErrNotFound) || strings.EqualFold(record.Status.State, "stopped") {
 		if err := m.ensureVolume(ctx, AgentVolumeName(name), name, "agent"); err != nil {
 			return State{}, err
 		}
-		if err := m.deleteStoppedContainer(ctx, AgentContainerName(name)); err != nil {
-			return State{}, err
+		if !errors.Is(err, ErrNotFound) {
+			if err := m.deleteStoppedContainer(ctx, AgentContainerName(name)); err != nil {
+				return State{}, err
+			}
 		}
 		if _, stderr, runErr := m.runner.Run(ctx, m.binary, AgentRunArguments(config)...); runErr != nil {
 			return State{}, commandError("recreate K3s agent", stderr, runErr)
@@ -448,11 +467,13 @@ func (m *Manager) Start(ctx context.Context, name string, timeout time.Duration)
 		return State{}, err
 	}
 	record, err := m.inspect(ctx, ContainerName(name))
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrNotFound) {
 		return State{}, err
 	}
-	if err := validateOwnedContainer(record, name, "server"); err != nil {
-		return State{}, err
+	if err == nil {
+		if err := validateOwnedContainer(record, name, "server"); err != nil {
+			return State{}, err
+		}
 	}
 	if addressChanged && strings.EqualFold(record.Status.State, "running") {
 		if _, stderr, stopErr := m.runner.Run(ctx, m.binary, "stop", ContainerName(name)); stopErr != nil {
@@ -460,12 +481,14 @@ func (m *Manager) Start(ctx context.Context, name string, timeout time.Duration)
 		}
 		record.Status.State = "stopped"
 	}
-	if strings.EqualFold(record.Status.State, "stopped") {
+	if errors.Is(err, ErrNotFound) || strings.EqualFold(record.Status.State, "stopped") {
 		if err := m.ensureVolume(ctx, ServerVolumeName(name), name, "server"); err != nil {
 			return State{}, err
 		}
-		if err := m.deleteStoppedContainer(ctx, ContainerName(name)); err != nil {
-			return State{}, err
+		if !errors.Is(err, ErrNotFound) {
+			if err := m.deleteStoppedContainer(ctx, ContainerName(name)); err != nil {
+				return State{}, err
+			}
 		}
 		if _, stderr, runErr := m.runner.Run(ctx, m.binary, ServerRunArguments(config)...); runErr != nil {
 			return State{}, commandError("recreate K3s node", stderr, runErr)
@@ -1006,25 +1029,17 @@ func (m *Manager) inspect(ctx context.Context, name string) (inspectRecord, erro
 }
 
 func (m *Manager) ensureVolume(ctx context.Context, name, clusterName, role string) error {
-	stdout, stderr, err := m.runner.Run(ctx, m.binary, "volume", "inspect", name)
-	if err == nil {
-		var records []volumeRecord
-		if decodeErr := json.Unmarshal(stdout, &records); decodeErr != nil {
-			return fmt.Errorf("decode volume inspect output: %w", decodeErr)
-		}
-		if len(records) != 1 {
-			return fmt.Errorf("volume inspect returned %d records", len(records))
-		}
-		labels := records[0].Configuration.Labels
-		if labels["apc.dev/managed"] != "true" || labels["apc.dev/cluster"] != clusterName || labels["apc.dev/role"] != role {
-			return fmt.Errorf("volume %q exists but is not the expected APC %s volume", name, role)
+	record, inspectErr := m.inspectVolume(ctx, name)
+	if inspectErr == nil {
+		if err := validateOwnedVolume(record, name, clusterName, role); err != nil {
+			return err
 		}
 		return nil
 	}
-	if !isNotFound(stderr) {
-		return commandError("inspect K3s data volume", stderr, err)
+	if !errors.Is(inspectErr, ErrNotFound) {
+		return inspectErr
 	}
-	_, stderr, err = m.runner.Run(ctx, m.binary,
+	_, stderr, err := m.runner.Run(ctx, m.binary,
 		"volume", "create",
 		"--label", "apc.dev/managed=true",
 		"--label", "apc.dev/cluster="+clusterName,
@@ -1049,7 +1064,14 @@ func (m *Manager) deleteStoppedContainer(ctx context.Context, name string) error
 func validateOwnedContainer(record inspectRecord, clusterName, role string) error {
 	labels := record.Configuration.Labels
 	if labels["apc.dev/managed"] != "true" || labels["apc.dev/cluster"] != clusterName || labels["apc.dev/role"] != role {
-		return fmt.Errorf("container %q exists but is not the expected APC %s node", ContainerName(clusterName), role)
+		containerName := ContainerName(clusterName)
+		switch role {
+		case "agent":
+			containerName = AgentContainerName(clusterName)
+		case "backup":
+			containerName = BackupContainerName(clusterName)
+		}
+		return fmt.Errorf("container %q exists but is not the expected APC %s node", containerName, role)
 	}
 	return nil
 }

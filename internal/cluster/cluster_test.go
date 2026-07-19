@@ -270,6 +270,105 @@ func TestAgentConfigRoundTrip(t *testing.T) {
 	}
 }
 
+func TestDeleteServerRemovesOnlyOwnedRuntimeDataAndConfiguration(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
+	config, err := normalizeConfig(Config{Name: "home", KubeconfigPath: filepath.Join(home, "custom-kubeconfig")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := saveClusterConfig(config); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePrivateFile(config.KubeconfigPath, []byte("apiVersion: v1\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetCurrentCluster("home"); err != nil {
+		t.Fatal(err)
+	}
+	containerInspect := `[{"configuration":{"labels":{"apc.dev/managed":"true","apc.dev/cluster":"home","apc.dev/role":"server"}},"status":{"state":"running"}}]`
+	volumeInspect := `[{"configuration":{"name":"apc-k3s-home-server-data","labels":{"apc.dev/managed":"true","apc.dev/cluster":"home","apc.dev/role":"server"}}}]`
+	runner := &scriptedRunner{responses: []runnerResponse{
+		{stdout: []byte(containerInspect)}, {}, {}, {stdout: []byte(volumeInspect)}, {},
+	}}
+	manager := NewManager("container")
+	manager.runner = runner
+	if err := manager.DeleteServer(context.Background(), "home", false); err != nil {
+		t.Fatal(err)
+	}
+	wantCalls := [][]string{
+		{"inspect", ContainerName("home")},
+		{"stop", ContainerName("home")},
+		{"delete", ContainerName("home")},
+		{"volume", "inspect", ServerVolumeName("home")},
+		{"volume", "delete", ServerVolumeName("home")},
+	}
+	if !reflect.DeepEqual(runner.calls, wantCalls) {
+		t.Fatalf("calls = %#v, want %#v", runner.calls, wantCalls)
+	}
+	if _, err := os.Stat(config.KubeconfigPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("custom kubeconfig was not removed: %v", err)
+	}
+	if _, err := CurrentCluster(); !errors.Is(err, ErrNoCurrentCluster) {
+		t.Fatalf("current cluster was not cleared: %v", err)
+	}
+}
+
+func TestDeleteAgentRefusesContainerWithoutExactOwnershipLabels(t *testing.T) {
+	inspect := `[{"configuration":{"labels":{"apc.dev/managed":"true","apc.dev/cluster":"other","apc.dev/role":"agent"}},"status":{"state":"running"}}]`
+	runner := &scriptedRunner{responses: []runnerResponse{{stdout: []byte(inspect)}}}
+	manager := NewManager("container")
+	manager.runner = runner
+	err := manager.DeleteAgent(context.Background(), "home", false)
+	if err == nil || !strings.Contains(err.Error(), "not the expected APC agent") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("unowned container was mutated: %#v", runner.calls)
+	}
+}
+
+func TestStartRecreatesMissingServerEnvelopeFromSavedConfigAndVolume(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
+	config, err := normalizeConfig(Config{Name: "home", NodeName: "macbook", StartupTimeout: 2 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := saveClusterConfig(config); err != nil {
+		t.Fatal(err)
+	}
+	ownedVolume := `[{"configuration":{"name":"apc-k3s-home-server-data","labels":{"apc.dev/managed":"true","apc.dev/cluster":"home","apc.dev/role":"server"}}}]`
+	runningContainer := `[{"configuration":{"labels":{"apc.dev/managed":"true","apc.dev/cluster":"home","apc.dev/role":"server","apc.dev/api-port":"16443"},"publishedPorts":[{"containerPort":16443,"hostAddress":"127.0.0.1","hostPort":16443,"proto":"tcp"}]},"status":{"state":"running","networks":[{"ipv4Address":"192.168.64.9/24"}]}}]`
+	kubeconfig := "apiVersion: v1\nclusters:\n- cluster:\n    server: https://127.0.0.1:6443\n"
+	nodes := `{"items":[{"metadata":{"name":"macbook"},"status":{"nodeInfo":{"kubeletVersion":"v1.36.2+k3s1"},"conditions":[{"type":"Ready","status":"True"}],"addresses":[{"type":"InternalIP","address":"192.168.64.9"}]}}]}`
+	notFound := runnerResponse{stderr: []byte("container not found"), err: errors.New("exit 1")}
+	runner := &scriptedRunner{responses: []runnerResponse{
+		notFound,
+		{stdout: []byte(ownedVolume)},
+		{},
+		{stdout: []byte("True;192.168.64.9")},
+		{stdout: []byte(runningContainer)},
+		{stdout: []byte(kubeconfig)},
+		{stdout: []byte(runningContainer)},
+		{stdout: []byte(nodes)},
+	}}
+	manager := NewManager("container")
+	manager.runner = runner
+	state, err := manager.Start(context.Background(), "home", 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.NodeReady || state.NodeName != "macbook" {
+		t.Fatalf("unexpected state: %#v", state)
+	}
+	if got := runner.calls[2]; len(got) == 0 || got[0] != "run" {
+		t.Fatalf("missing server recreation: %#v", got)
+	}
+}
+
 func mustCIDR(t *testing.T, value string) *net.IPNet {
 	t.Helper()
 	ip, network, err := net.ParseCIDR(value)

@@ -1,6 +1,6 @@
 # K3s on Apple container 1.0: two-Mac spike results
 
-Initial run: 2026-07-17. CLI/context follow-up and network recheck: 2026-07-18.
+Initial run: 2026-07-17. Lifecycle and recovery follow-up: 2026-07-19.
 
 The spike ran a pinned, native ARM64 K3s server in an Apple container VM on a
 MacBook and a K3s agent in a second Apple container VM on a Mac mini. APC v1
@@ -23,6 +23,10 @@ intentionally omitted.
 | CoreDNS and ClusterIP | Pass | Pod DNS lookup and Service request succeeded |
 | `kubectl logs` and `kubectl exec` across hosts | Pass | API-to-kubelet path worked for both nodes |
 | Server state persistence | Pass | Kubernetes and Helm state survived VM-envelope replacement on a named volume |
+| Delete/keep-data recovery | Pass | Label-checked deletion retained the selected volume and `start` recreated the missing envelope |
+| Offline backup and restore | Pass | A ConfigMap changed after backup returned to its original value after checksum-validated restore |
+| Digest-only upgrade and rollback base | Pass | Server recreated from an alternate ARM64 manifest digest, retained data and reached Ready; pre-upgrade backup recorded |
+| launchd supervision | Pass | Background LaunchAgents ran on both Macs and reconciled server/agent without failures |
 | Dynamic private VM address | Pass | Boot wrapper set K3s `--node-ip`; Kubernetes updated `InternalIP` |
 | Full simultaneous restart/reconnect | Blocked by host runtime | MacBook Apple VMs lost all LAN/Internet routing while the host and Mac mini remained healthy |
 | WireGuard-native Flannel | Unsupported | Apple container 1.0 guest kernel returned `operation not supported` |
@@ -54,8 +58,8 @@ intentionally omitted.
    trusted LAN. Do not expose VXLAN directly to an untrusted network.
 3. Select a restart-safe CNI/network-policy implementation and re-enable
    Kubernetes NetworkPolicy semantics.
-4. Add cluster deletion, upgrades, backup/restore and three-server embedded-etcd
-   HA. A two-node server/agent cluster is not control-plane HA.
+4. Add three-server embedded-etcd HA. A two-node server/agent cluster is not
+   control-plane HA.
 
 The kubectl-compatible APC frontend is now implemented. Additional Kubernetes
 verbs inherit their behavior from the installed native `kubectl`; APC does not
@@ -116,3 +120,17 @@ Finally, `apc node stop/start` replaced the Mini agent from its saved
 configuration and persistent identity. A post-restart doctor with public egress
 intentionally skipped reported 16 passes, two warnings and zero failures,
 including both directed VXLAN paths and deterministic ClusterIP routing.
+
+The lifecycle follow-up then exercised an isolated cluster through full
+create/delete-with-keep-data/start/delete. A second run wrote a Kubernetes
+ConfigMap, made an offline volume backup, changed the ConfigMap and restored the
+backup; the original value and Ready state returned. A third run changed the
+server from the pinned multi-platform digest to its pinned ARM64 manifest
+digest through `cluster upgrade`; Kubernetes data remained present and the
+pre-upgrade rollback backup was valid. All temporary clusters, volumes and
+backups were removed afterward.
+
+Finally, stable `~/.local/bin/apc` builds were installed on both Macs. The
+server and agent Background LaunchAgents are active in each user's headless-safe
+launchd domain, their supervisor logs are empty, and a follow-up deep doctor
+reported 16 passes, two intentionally skipped egress warnings and zero failures.
