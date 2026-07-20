@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -26,10 +29,22 @@ func Open(path string) (*Store, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("database path is required")
 	}
+	var databaseFile os.FileInfo
 	if path != ":memory:" {
-		path, _ = filepath.Abs(path)
+		var err error
+		path, err = filepath.Abs(path)
+		if err != nil {
+			return nil, fmt.Errorf("resolve database path: %w", err)
+		}
+		databaseFile, err = secureDatabaseFile(path)
+		if err != nil {
+			return nil, err
+		}
+		if err := secureExistingSQLiteSidecars(path); err != nil {
+			return nil, err
+		}
 	}
-	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
+	dsn := sqliteDSN(path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
@@ -39,11 +54,210 @@ func Open(path string) (*Store, error) {
 	s := &Store{db: db}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open sqlite: %w", err)
+	}
+	if path != ":memory:" {
+		if err := verifyOpenedDatabase(ctx, db, path, databaseFile); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+	}
 	if err := s.migrate(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
+	if path != ":memory:" {
+		if err := verifyDatabaseFile(path, databaseFile); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+		if err := secureExistingSQLiteSidecars(path); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+	}
 	return s, nil
+}
+
+func sqliteDSN(path string) string {
+	query := url.Values{}
+	query.Add("_pragma", "busy_timeout(5000)")
+	query.Add("_pragma", "journal_mode(WAL)")
+	query.Add("_pragma", "foreign_keys(1)")
+	if path == ":memory:" {
+		return "file::memory:?" + query.Encode()
+	}
+	databaseURL := &url.URL{Scheme: "file", Path: path, RawQuery: query.Encode()}
+	return databaseURL.String()
+}
+
+func verifyOpenedDatabase(ctx context.Context, db *sql.DB, expectedPath string, expectedFile os.FileInfo) error {
+	rows, err := db.QueryContext(ctx, `PRAGMA database_list`)
+	if err != nil {
+		return fmt.Errorf("inspect opened sqlite database: %w", err)
+	}
+	defer rows.Close()
+	openedPath := ""
+	for rows.Next() {
+		var sequence int
+		var name, path string
+		if err := rows.Scan(&sequence, &name, &path); err != nil {
+			return fmt.Errorf("inspect opened sqlite database: %w", err)
+		}
+		if name == "main" {
+			openedPath = path
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("inspect opened sqlite database: %w", err)
+	}
+	if openedPath == "" {
+		return fmt.Errorf("opened sqlite database did not report an on-disk main file")
+	}
+	openedPath, err = filepath.Abs(openedPath)
+	if err != nil {
+		return fmt.Errorf("resolve opened sqlite database path: %w", err)
+	}
+	openedPath = filepath.Clean(openedPath)
+	openedInfo, err := os.Lstat(openedPath)
+	if err != nil {
+		return fmt.Errorf("inspect opened sqlite database path: %w", err)
+	}
+	if openedInfo.Mode()&os.ModeSymlink != 0 || !openedInfo.Mode().IsRegular() || !os.SameFile(expectedFile, openedInfo) {
+		return fmt.Errorf("sqlite opened %q instead of secured database %q", openedPath, filepath.Clean(expectedPath))
+	}
+	return nil
+}
+
+func secureExistingSQLiteSidecars(databasePath string) error {
+	for _, suffix := range []string{"-wal", "-shm"} {
+		path := databasePath + suffix
+		info, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("inspect sqlite sidecar %s: %w", suffix, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return fmt.Errorf("sqlite sidecar %s must be a regular file and not a symbolic link", suffix)
+		}
+		file, err := openDatabaseFileNoFollow(path)
+		if err != nil {
+			return fmt.Errorf("secure sqlite sidecar %s: %w", suffix, err)
+		}
+		_, secureErr := secureOpenedDatabaseFile(file, info)
+		if closeErr := file.Close(); secureErr == nil && closeErr != nil {
+			secureErr = closeErr
+		}
+		if secureErr != nil {
+			return fmt.Errorf("secure sqlite sidecar %s: %w", suffix, secureErr)
+		}
+	}
+	return nil
+}
+
+func secureDatabaseFile(path string) (os.FileInfo, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		info, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			file, createErr := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+			if errors.Is(createErr, os.ErrExist) {
+				continue
+			}
+			if createErr != nil {
+				return nil, fmt.Errorf("create private sqlite database: %w", createErr)
+			}
+			createdInfo, secureErr := secureOpenedDatabaseFile(file, nil)
+			if closeErr := file.Close(); secureErr == nil && closeErr != nil {
+				secureErr = closeErr
+			}
+			if secureErr != nil {
+				return nil, fmt.Errorf("secure new sqlite database: %w", secureErr)
+			}
+			return createdInfo, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("inspect sqlite database path: %w", err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("sqlite database path must not be a symbolic link")
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("sqlite database path must be a regular file")
+		}
+
+		file, err := openDatabaseFileNoFollow(path)
+		if err != nil {
+			return nil, err
+		}
+		securedInfo, secureErr := secureOpenedDatabaseFile(file, info)
+		if closeErr := file.Close(); secureErr == nil && closeErr != nil {
+			secureErr = closeErr
+		}
+		if secureErr != nil {
+			return nil, secureErr
+		}
+		return securedInfo, nil
+	}
+	return nil, fmt.Errorf("sqlite database path changed while it was being secured")
+}
+
+func openDatabaseFileNoFollow(path string) (*os.File, error) {
+	fileDescriptor, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		fileDescriptor, err = syscall.Open(path, syscall.O_WRONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite database without following links: %w", err)
+	}
+	return os.NewFile(uintptr(fileDescriptor), path), nil
+}
+
+func secureOpenedDatabaseFile(file *os.File, expected os.FileInfo) (os.FileInfo, error) {
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("inspect opened sqlite database: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("sqlite database path must be a regular file")
+	}
+	if expected != nil && !os.SameFile(expected, info) {
+		return nil, fmt.Errorf("sqlite database path changed while it was being secured")
+	}
+	if err := file.Chmod(0o600); err != nil {
+		return nil, fmt.Errorf("set private sqlite database permissions: %w", err)
+	}
+	info, err = file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("verify private sqlite database permissions: %w", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		return nil, fmt.Errorf("sqlite database permissions are %04o, want 0600", info.Mode().Perm())
+	}
+	return info, nil
+}
+
+func verifyDatabaseFile(path string, expected os.FileInfo) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("verify sqlite database path: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("sqlite database path became a symbolic link")
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("sqlite database path is no longer a regular file")
+	}
+	if !os.SameFile(expected, info) {
+		return fmt.Errorf("sqlite database path changed while it was open")
+	}
+	if info.Mode().Perm() != 0o600 {
+		return fmt.Errorf("sqlite database permissions are %04o, want 0600", info.Mode().Perm())
+	}
+	return nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }

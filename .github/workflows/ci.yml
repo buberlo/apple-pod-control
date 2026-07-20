@@ -23,3 +23,7 @@ jobs:
         run: go vet ./...
       - name: Build
         run: make build
+      - name: Validate hardware acceptance harness
+        run: |
+          bash -n scripts/hardware-acceptance.sh scripts/test-hardware-acceptance.sh
+          bash scripts/test-hardware-acceptance.sh

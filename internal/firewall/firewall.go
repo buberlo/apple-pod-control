@@ -332,6 +332,17 @@ func writeToken(path string, token []byte) error {
 		_ = temporary.Close()
 		return fmt.Errorf("protect PF reference token: %w", err)
 	}
+	// The privileged installer may inherit the invoking user's primary group
+	// even though its effective UID is root. Verification deliberately requires
+	// root:wheel, so set both owners explicitly before publishing the token.
+	if err := temporary.Chown(0, 0); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("own PF reference token: %w", err)
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("sync PF reference token: %w", err)
+	}
 	if err := temporary.Close(); err != nil {
 		return fmt.Errorf("close PF reference token: %w", err)
 	}

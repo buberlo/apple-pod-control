@@ -294,6 +294,9 @@ func normalizeHAConfig(config HAConfig) (HAConfig, error) {
 		}
 		seenPorts[member.HostAPIPort] = true
 	}
+	if _, err := haProxyEndpoint(config); err != nil {
+		return HAConfig{}, fmt.Errorf("invalid derived HA proxy endpoint: %w", err)
+	}
 	return config, nil
 }
 
@@ -362,7 +365,35 @@ func HAServerRunArguments(config HAConfig, member HAMember) []string {
 
 func haInitArguments(config HAConfig, member HAMember) []string {
 	prefix, _ := netip.ParsePrefix(config.Subnet)
+	reservedByPeers := make([]string, 0, len(config.Members)-1)
+	for _, peer := range config.Members {
+		if peer.ID != member.ID {
+			reservedByPeers = append(reservedByPeers, peer.StableIP)
+		}
+	}
+	sort.Strings(reservedByPeers)
+	script := fmt.Sprintf(
+		"PRIMARY_IP=$(ip -o -4 addr show dev eth0 scope global | awk 'NR == 1 {split($4, address, \"/\"); print address[1]}'); case \"$PRIMARY_IP\" in %s) echo \"%s$PRIMARY_IP\" >&2; exit 78;; esac; ip address add %s/%d dev eth0 2>/dev/null || true; ip route replace %s dev eth0 src %s; exec /bin/k3s \"$@\"",
+		strings.Join(reservedByPeers, "|"),
+		haRuntimeIPCollisionMarker,
+		member.StableIP,
+		prefix.Bits(),
+		config.Subnet,
+		member.StableIP,
+	)
+	return haInitArgumentsWithScript(config, member, script)
+}
+
+// legacyHAInitArguments is the one immediately preceding APC HA envelope
+// identity. It is retained only so APC can safely validate and replace those
+// exact envelopes during restore or a rolling lifecycle migration.
+func legacyHAInitArguments(config HAConfig, member HAMember) []string {
+	prefix, _ := netip.ParsePrefix(config.Subnet)
 	script := fmt.Sprintf("ip address add %s/%d dev eth0 2>/dev/null || true; ip route replace %s dev eth0 src %s; exec /bin/k3s \"$@\"", member.StableIP, prefix.Bits(), config.Subnet, member.StableIP)
+	return haInitArgumentsWithScript(config, member, script)
+}
+
+func haInitArgumentsWithScript(config HAConfig, member HAMember, script string) []string {
 	arguments := []string{"-c", script, "apc-k3s", "server"}
 	if member.ID == 1 {
 		arguments = append(arguments, "--cluster-init")
@@ -413,15 +444,31 @@ func containsString(values []string, expected string) bool {
 	return false
 }
 
+type haContainerUserID struct {
+	UID int `json:"uid"`
+	GID int `json:"gid"`
+}
+
 type haContainerInspect struct {
 	Configuration struct {
+		Platform struct {
+			Architecture string `json:"architecture"`
+			OS           string `json:"os"`
+		} `json:"platform"`
 		Labels map[string]string `json:"labels"`
 		Image  struct {
 			Reference string `json:"reference"`
 		} `json:"image"`
 		InitProcess struct {
-			Arguments []string `json:"arguments"`
+			Arguments  []string `json:"arguments"`
+			Executable string   `json:"executable"`
+			Terminal   bool     `json:"terminal"`
+			User       struct {
+				ID *haContainerUserID `json:"id"`
+			} `json:"user"`
 		} `json:"initProcess"`
+		CapAdd   []string `json:"capAdd"`
+		CapDrop  []string `json:"capDrop"`
 		Networks []struct {
 			Network string `json:"network"`
 			Options struct {
@@ -431,11 +478,13 @@ type haContainerInspect struct {
 		} `json:"networks"`
 		PublishedPorts []struct {
 			ContainerPort int    `json:"containerPort"`
+			Count         int    `json:"count"`
 			HostAddress   string `json:"hostAddress"`
 			HostPort      int    `json:"hostPort"`
 			Proto         string `json:"proto"`
 		} `json:"publishedPorts"`
-		Mounts []struct {
+		PublishedSockets []json.RawMessage `json:"publishedSockets"`
+		Mounts           []struct {
 			Destination string   `json:"destination"`
 			Source      string   `json:"source"`
 			Options     []string `json:"options"`
@@ -450,6 +499,12 @@ type haContainerInspect struct {
 			CPUs          int   `json:"cpus"`
 			MemoryInBytes int64 `json:"memoryInBytes"`
 		} `json:"resources"`
+		ReadOnly       bool              `json:"readOnly"`
+		Rosetta        bool              `json:"rosetta"`
+		SSH            bool              `json:"ssh"`
+		Sysctls        map[string]string `json:"sysctls"`
+		UseInit        bool              `json:"useInit"`
+		Virtualization bool              `json:"virtualization"`
 	} `json:"configuration"`
 	Status struct {
 		State    string `json:"state"`
@@ -540,53 +595,67 @@ func validateHALabels(labels map[string]string, clusterName, role string, member
 }
 
 func validateHAContainer(record haContainerInspect, config HAConfig, member HAMember) error {
+	name := HAContainerName(config.Name, member.ID)
 	if err := validateHALabels(record.Configuration.Labels, config.Name, "server", member.ID); err != nil {
-		return fmt.Errorf("container %q: %w", HAContainerName(config.Name, member.ID), err)
+		return fmt.Errorf("container %q: %w", name, err)
 	}
 	if record.Configuration.Image.Reference != config.Image {
-		return fmt.Errorf("container %q uses image %q, expected %q", HAContainerName(config.Name, member.ID), record.Configuration.Image.Reference, config.Image)
+		return fmt.Errorf("container %q uses image %q, expected %q", name, record.Configuration.Image.Reference, config.Image)
 	}
-	if !reflect.DeepEqual(record.Configuration.InitProcess.Arguments, haInitArguments(config, member)) {
-		return fmt.Errorf("container %q does not match the declared K3s member identity", HAContainerName(config.Name, member.ID))
+	if record.Configuration.Platform.OS != "linux" || record.Configuration.Platform.Architecture != "arm64" {
+		return fmt.Errorf("container %q does not use the declared linux/arm64 platform", name)
 	}
-	networkMatches := false
-	for _, network := range record.Configuration.Networks {
-		if network.Network == config.NetworkName && strings.EqualFold(network.Options.MACAddress, member.MAC) && network.Options.MTU == 1280 {
-			networkMatches = true
-			break
-		}
+	process := record.Configuration.InitProcess
+	currentInit := reflect.DeepEqual(process.Arguments, haInitArguments(config, member))
+	legacyInit := reflect.DeepEqual(process.Arguments, legacyHAInitArguments(config, member))
+	if process.Executable != "/bin/sh" || process.Terminal || process.User.ID == nil || process.User.ID.UID != 0 || process.User.ID.GID != 0 || (!currentInit && !legacyInit) {
+		return fmt.Errorf("container %q does not match the declared root, non-TTY K3s init process", name)
 	}
-	if !networkMatches {
-		return fmt.Errorf("container %q does not match network %q, MAC %s and MTU 1280", HAContainerName(config.Name, member.ID), config.NetworkName, member.MAC)
+	if !reflect.DeepEqual(record.Configuration.CapAdd, []string{"ALL"}) || len(record.Configuration.CapDrop) != 0 {
+		return fmt.Errorf("container %q does not use exactly cap-add ALL with no dropped capabilities", name)
 	}
-	portMatches := false
-	for _, port := range record.Configuration.PublishedPorts {
-		if port.ContainerPort == 6443 && port.HostPort == member.HostAPIPort && port.HostAddress == config.ListenAddress && strings.EqualFold(port.Proto, "tcp") {
-			portMatches = true
-			break
-		}
+	if len(record.Configuration.Networks) != 1 {
+		return fmt.Errorf("container %q has %d networks, expected exactly one", name, len(record.Configuration.Networks))
 	}
-	if !portMatches {
-		return fmt.Errorf("container %q does not publish the declared API endpoint", HAContainerName(config.Name, member.ID))
+	network := record.Configuration.Networks[0]
+	if network.Network != config.NetworkName || !strings.EqualFold(network.Options.MACAddress, member.MAC) || network.Options.MTU != 1280 {
+		return fmt.Errorf("container %q does not match network %q, MAC %s and MTU 1280", name, config.NetworkName, member.MAC)
+	}
+	if len(record.Configuration.PublishedPorts) != 1 || len(record.Configuration.PublishedSockets) != 0 {
+		return fmt.Errorf("container %q must publish exactly one API port and no sockets", name)
+	}
+	port := record.Configuration.PublishedPorts[0]
+	if port.ContainerPort != 6443 || port.Count != 1 || port.HostPort != member.HostAPIPort || port.HostAddress != config.ListenAddress || port.Proto != "tcp" {
+		return fmt.Errorf("container %q does not publish the declared API endpoint", name)
+	}
+	if len(record.Configuration.Mounts) != 2 {
+		return fmt.Errorf("container %q has %d mounts, expected exactly two", name, len(record.Configuration.Mounts))
 	}
 	volumeMatches := false
 	tokenMountMatches := false
 	for _, mount := range record.Configuration.Mounts {
-		if mount.Destination == "/var/lib/rancher/k3s" && mount.Type.Volume != nil && mount.Type.Volume.Name == HAVolumeName(config.Name, member.ID) {
+		if mount.Destination == "/var/lib/rancher/k3s" && mount.Type.Volume != nil && mount.Type.Volume.Name == HAVolumeName(config.Name, member.ID) && mount.Type.VirtioFS == nil && len(mount.Options) == 0 && !volumeMatches {
 			volumeMatches = true
 		}
-		if mount.Destination == "/run/secrets/apc" && mount.Source == filepath.Dir(config.TokenFile) && mount.Type.VirtioFS != nil && containsString(mount.Options, "ro") {
+		if mount.Destination == "/run/secrets/apc" && mount.Source == filepath.Dir(config.TokenFile) && mount.Type.VirtioFS != nil && mount.Type.Volume == nil && reflect.DeepEqual(mount.Options, []string{"ro"}) && !tokenMountMatches {
 			tokenMountMatches = true
 		}
 	}
 	if !volumeMatches || !tokenMountMatches {
-		return fmt.Errorf("container %q does not use the declared data volume and read-only token mount", HAContainerName(config.Name, member.ID))
+		return fmt.Errorf("container %q does not use exactly the declared data volume and read-only token mount", name)
 	}
 	memoryBytes, _ := parseHAByteSize(config.Memory)
 	if record.Configuration.Resources.CPUs != config.CPUs || uint64(record.Configuration.Resources.MemoryInBytes) != memoryBytes {
-		return fmt.Errorf("container %q does not match the declared CPU and memory resources", HAContainerName(config.Name, member.ID))
+		return fmt.Errorf("container %q does not match the declared CPU and memory resources", name)
+	}
+	if record.Configuration.ReadOnly || record.Configuration.Rosetta || record.Configuration.SSH || record.Configuration.UseInit || record.Configuration.Virtualization || len(record.Configuration.Sysctls) != 0 {
+		return fmt.Errorf("container %q enables an unexpected runtime feature", name)
 	}
 	return nil
+}
+
+func haContainerUsesLegacyInit(record haContainerInspect, config HAConfig, member HAMember) bool {
+	return reflect.DeepEqual(record.Configuration.InitProcess.Arguments, legacyHAInitArguments(config, member))
 }
 
 func validateHAVolume(record haVolumeInspect, config HAConfig, member HAMember) error {
@@ -697,11 +766,20 @@ func checkHALegacyCollision(name string) error {
 	return nil
 }
 
-func (m *Manager) CreateHA(ctx context.Context, config HAConfig) (HAState, error) {
-	config, err := normalizeHAConfig(config)
+func (m *Manager) CreateHA(ctx context.Context, config HAConfig) (result HAState, err error) {
+	config, err = normalizeHAConfig(config)
 	if err != nil {
 		return HAState{}, err
 	}
+	lock, err := acquireHALifecycleOperationLock(ctx, config.Name)
+	if err != nil {
+		return HAState{}, err
+	}
+	defer func() { err = errors.Join(err, lock.release()) }()
+	return m.createHALocked(ctx, config)
+}
+
+func (m *Manager) createHALocked(ctx context.Context, config HAConfig) (HAState, error) {
 	if err := checkHALegacyCollision(config.Name); err != nil {
 		return HAState{}, err
 	}
@@ -716,6 +794,9 @@ func (m *Manager) CreateHA(ctx context.Context, config HAConfig) (HAState, error
 	if err != nil {
 		return HAState{}, err
 	}
+	if err := validateHACurrentRuntimeIPReservations(config, preflight.containerRecord); err != nil {
+		return HAState{}, err
+	}
 	fresh := len(preflight.volumeExists) == 0
 	if err := ensureHAToken(config.TokenFile, fresh); err != nil {
 		return HAState{}, err
@@ -724,6 +805,12 @@ func (m *Manager) CreateHA(ctx context.Context, config HAConfig) (HAState, error
 	// partially failed bootstrap can still be inspected and safely deleted.
 	if err := saveHAConfig(config); err != nil {
 		return HAState{}, err
+	}
+	// CreateHA is also the idempotent reconcile entry point. Persist Running
+	// only after all read-only identity/preflight checks have succeeded, but
+	// before the first network, volume, or VM mutation.
+	if err := markHAClusterRunningLocked(config.Name); err != nil {
+		return HAState{}, fmt.Errorf("persist running HA intent before create: %w", err)
 	}
 	createdNetwork := false
 	if !preflight.networkExists {
@@ -817,17 +904,36 @@ func (m *Manager) rollbackHAFreshInfrastructure(ctx context.Context, config HACo
 
 func (m *Manager) reconcileHAMember(ctx context.Context, config HAConfig, member HAMember, record haContainerInspect) error {
 	if record.Configuration.Labels != nil {
+		if err := validateHAContainer(record, config, member); err != nil {
+			return err
+		}
 		if strings.EqualFold(record.Status.State, "running") {
+			if !haContainerUsesLegacyInit(record, config, member) {
+				return nil
+			}
+			_, restartNeeded, stopErr := m.stopHAMemberLocked(ctx, config, member)
+			if stopErr != nil {
+				if !restartNeeded {
+					return fmt.Errorf("stop legacy HA member %d for guarded-envelope migration: %w", member.ID, stopErr)
+				}
+				recoveryCtx, cancelRecovery := context.WithTimeout(context.WithoutCancel(ctx), haRuntimeOperationTimeout)
+				defer cancelRecovery()
+				_, recoveryErr := m.startHAMemberLocked(recoveryCtx, config, member)
+				return errors.Join(
+					fmt.Errorf("stop legacy HA member %d for guarded-envelope migration: %w", member.ID, stopErr),
+					recoveryErr,
+				)
+			}
+			if _, err := m.startHAMemberLocked(ctx, config, member); err != nil {
+				return fmt.Errorf("start guarded HA member %d after legacy-envelope migration: %w", member.ID, err)
+			}
 			return nil
 		}
 		if err := m.runHABounded(ctx, fmt.Sprintf("delete stopped HA server member %d", member.ID), "delete", HAContainerName(config.Name, member.ID)); err != nil {
 			return err
 		}
 	}
-	if _, stderr, err := m.runner.Run(ctx, m.binary, HAServerRunArguments(config, member)...); err != nil {
-		return commandError("start HA server", stderr, err)
-	}
-	return nil
+	return m.runHAServerEnvelope(ctx, config, member, "start HA server", haRuntimeOperationTimeout)
 }
 
 type haNodeDocument struct {
@@ -1001,6 +1107,10 @@ func loadHAClientTLSConfig(path string) (*tls.Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read HA kubeconfig credentials: %w", err)
 	}
+	return loadHAClientTLSConfigData(data)
+}
+
+func loadHAClientTLSConfigData(data []byte) (*tls.Config, error) {
 	var document struct {
 		Clusters []struct {
 			Cluster struct {
@@ -1047,10 +1157,50 @@ func loadHAClientTLSConfig(path string) (*tls.Config, error) {
 	}, nil
 }
 
-// PrepareKubeconfig selects the first reachable, Ready HA API endpoint and
-// refreshes the protected kubeconfig before a kubectl-compatible APC command.
-// Legacy single-server clusters keep their existing resolution path.
+type haReadyEndpointProbe func(context.Context, string, *tls.Config) bool
+
+func probeHAReadyEndpoint(ctx context.Context, endpoint string, tlsConfig *tls.Config) bool {
+	probeCtx, cancelProbe := context.WithTimeout(ctx, 3*time.Second)
+	defer cancelProbe()
+	request, err := http.NewRequestWithContext(probeCtx, http.MethodGet, endpoint+"/readyz", nil)
+	if err != nil {
+		return false
+	}
+	transport := &http.Transport{TLSClientConfig: tlsConfig.Clone(), DisableKeepAlives: true}
+	defer transport.CloseIdleConnections()
+	response, err := (&http.Client{Transport: transport}).Do(request)
+	if err != nil {
+		return false
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, 128))
+	return err == nil && response.StatusCode == http.StatusOK && strings.TrimSpace(string(body)) == "ok"
+}
+
+func rewriteHAKubeconfigEndpoint(data []byte, endpoint string) ([]byte, error) {
+	var document yaml.Node
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		return nil, fmt.Errorf("decode HA kubeconfig: %w", err)
+	}
+	if !replaceScalar(&document, "server", endpoint) {
+		return nil, fmt.Errorf("HA kubeconfig does not contain a server endpoint")
+	}
+	output, err := yaml.Marshal(&document)
+	if err != nil {
+		return nil, fmt.Errorf("encode HA kubeconfig: %w", err)
+	}
+	return output, nil
+}
+
+// PrepareKubeconfig prefers the stable local HA proxy after an authenticated
+// readiness probe. If the supervisor proxy is absent or unhealthy, it safely
+// falls back to an individually Ready member. Legacy single-server clusters
+// keep their existing resolution path.
 func (m *Manager) PrepareKubeconfig(ctx context.Context, name string) (string, error) {
+	return m.prepareKubeconfig(ctx, name, probeHAReadyEndpoint)
+}
+
+func (m *Manager) prepareKubeconfig(ctx context.Context, name string, probe haReadyEndpointProbe) (string, error) {
 	config, err := loadHAConfig(name)
 	if errors.Is(err, os.ErrNotExist) {
 		return ResolvedKubeconfigPath(name)
@@ -1058,6 +1208,12 @@ func (m *Manager) PrepareKubeconfig(ctx context.Context, name string) (string, e
 	if err != nil {
 		return "", err
 	}
+	return m.prepareHAKubeconfigFromConfig(ctx, config, probe)
+}
+
+func (m *Manager) prepareHAKubeconfigFromConfig(ctx context.Context, config HAConfig, probe haReadyEndpointProbe) (string, error) {
+	proxyEndpoint, proxyEndpointErr := haProxyEndpoint(config)
+	proxyAttempted := false
 	for _, member := range config.Members {
 		record, inspectErr := m.inspectHAContainer(ctx, HAContainerName(config.Name, member.ID))
 		if errors.Is(inspectErr, ErrNotFound) {
@@ -1076,35 +1232,84 @@ func (m *Manager) PrepareKubeconfig(ctx context.Context, name string) (string, e
 		if nodeErr != nil || !nodeDocumentReady(node) {
 			continue
 		}
-		kubeconfig, readErr := m.readKubeconfig(ctx, HAContainerName(config.Name, member.ID), member.apiEndpoint(config.ListenAddress))
+		directEndpoint := member.apiEndpoint(config.ListenAddress)
+		kubeconfig, readErr := m.readKubeconfig(ctx, HAContainerName(config.Name, member.ID), directEndpoint)
 		if readErr != nil {
 			continue
 		}
-		if err := writePrivateFileAtomic(config.KubeconfigPath, kubeconfig); err != nil {
-			return "", fmt.Errorf("refresh HA kubeconfig: %w", err)
-		}
-		if !m.probeHAAPI(ctx, config, member) {
+		tlsConfig, tlsErr := loadHAClientTLSConfigData(kubeconfig)
+		if tlsErr != nil {
 			continue
 		}
-		return config.KubeconfigPath, nil
+		if proxyEndpointErr == nil && !proxyAttempted {
+			proxyAttempted = true
+			proxyKubeconfig, rewriteErr := rewriteHAKubeconfigEndpoint(kubeconfig, proxyEndpoint)
+			if rewriteErr != nil {
+				return "", rewriteErr
+			}
+			if probe(ctx, proxyEndpoint, tlsConfig) {
+				if err := writePrivateFileAtomic(config.KubeconfigPath, proxyKubeconfig); err != nil {
+					return "", fmt.Errorf("refresh HA kubeconfig for stable proxy: %w", err)
+				}
+				return config.KubeconfigPath, nil
+			}
+		}
+		if probe(ctx, directEndpoint, tlsConfig) {
+			if err := writePrivateFileAtomic(config.KubeconfigPath, kubeconfig); err != nil {
+				return "", fmt.Errorf("refresh HA kubeconfig: %w", err)
+			}
+			return config.KubeconfigPath, nil
+		}
 	}
-	return "", fmt.Errorf("HA cluster %q has no reachable Ready API endpoint", name)
+	return "", fmt.Errorf("HA cluster %q has no reachable Ready API endpoint", config.Name)
 }
 
-func (m *Manager) StartHA(ctx context.Context, name string, timeout time.Duration) (HAState, error) {
+func (m *Manager) StartHA(ctx context.Context, name string, timeout time.Duration) (result HAState, err error) {
+	lock, err := acquireHALifecycleOperationLock(ctx, name)
+	if err != nil {
+		return HAState{}, err
+	}
+	defer func() { err = errors.Join(err, lock.release()) }()
+	return m.startHALocked(ctx, name, timeout)
+}
+
+func (m *Manager) startHALocked(ctx context.Context, name string, timeout time.Duration) (HAState, error) {
 	config, err := loadHAConfig(name)
 	if err != nil {
+		return HAState{}, err
+	}
+	// Persist operator intent before touching runtime state so the supervisor
+	// can distinguish an interrupted start from an intentional stop.
+	if err := markHAClusterRunningLocked(config.Name); err != nil {
 		return HAState{}, err
 	}
 	if timeout > 0 {
 		config.StartupTimeout = timeout
 	}
-	return m.CreateHA(ctx, config)
+	config, err = normalizeHAConfig(config)
+	if err != nil {
+		return HAState{}, err
+	}
+	return m.createHALocked(ctx, config)
 }
 
-func (m *Manager) StopHA(ctx context.Context, name string) error {
+func (m *Manager) StopHA(ctx context.Context, name string) (err error) {
+	lock, err := acquireHALifecycleOperationLock(ctx, name)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, lock.release()) }()
+	return m.stopHALocked(ctx, name)
+}
+
+func (m *Manager) stopHALocked(ctx context.Context, name string) error {
 	config, err := loadHAConfig(name)
 	if err != nil {
+		return err
+	}
+	// Intent must be durable before the first VM is stopped; otherwise the HA
+	// supervisor could immediately undo an operator-requested cluster stop.
+	if err := markHAClusterStoppedLocked(config.Name); err != nil {
 		return err
 	}
 	preflight, err := m.preflightHA(ctx, config, true)
@@ -1124,10 +1329,26 @@ func (m *Manager) StopHA(ctx context.Context, name string) error {
 	return nil
 }
 
-func (m *Manager) DeleteHA(ctx context.Context, name string, keepData bool) error {
+func (m *Manager) DeleteHA(ctx context.Context, name string, keepData bool) (err error) {
+	lock, err := acquireHALifecycleOperationLock(ctx, name)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, lock.release()) }()
+	return m.deleteHALocked(ctx, name, keepData)
+}
+
+func (m *Manager) deleteHALocked(ctx context.Context, name string, keepData bool) error {
 	config, err := loadHAConfig(name)
 	if err != nil {
 		return err
+	}
+	if keepData {
+		// A keep-data delete is an intentional stopped state which StartHA may
+		// later reconcile. Persist that intent before deleting any envelope.
+		if err := markHAClusterStoppedLocked(config.Name); err != nil {
+			return err
+		}
 	}
 	preflight, err := m.preflightHA(ctx, config, true)
 	if err != nil {
@@ -1170,13 +1391,30 @@ func (m *Manager) DeleteHA(ctx context.Context, name string, keepData bool) erro
 	if err != nil {
 		return err
 	}
-	if err := removeExactFiles([]string{configPath, config.KubeconfigPath, config.TokenFile}); err != nil {
+	recoveryPath, err := HARecoveryStatePath(config.Name)
+	if err != nil {
+		return err
+	}
+	desiredPath, err := haDesiredStatePath(config.Name)
+	if err != nil {
+		return err
+	}
+	// Keep the authoritative config until last so an interrupted local cleanup
+	// remains retryable. A full data delete also retires journals from the old
+	// cluster identity; --keep-data intentionally preserves both state files.
+	if err := removeExactFiles([]string{config.KubeconfigPath, config.TokenFile, recoveryPath, desiredPath, configPath}); err != nil {
 		return err
 	}
 	if err := clearCurrentCluster(config.Name); err != nil {
 		return err
 	}
 	return removeEmptyClusterDirectory(config.Name)
+}
+
+func acquireHALifecycleOperationLock(ctx context.Context, name string) (*haOperationLock, error) {
+	lockCtx, cancel := context.WithTimeout(ctx, haRuntimeOperationTimeout)
+	defer cancel()
+	return acquireHAOperationLock(lockCtx, name)
 }
 
 func (m *Manager) runHABounded(ctx context.Context, operation string, arguments ...string) error {
@@ -1270,6 +1508,10 @@ func sameHARuntimeConfig(left, right HAConfig) bool {
 }
 
 func writePrivateFileAtomic(path string, data []byte) error {
+	return writePrivateFileAtomicWithDirectorySync(path, data, syncHADirectory)
+}
+
+func writePrivateFileAtomicWithDirectorySync(path string, data []byte, syncDirectory func(string) error) error {
 	directory := filepath.Dir(path)
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return fmt.Errorf("create private file directory: %w", err)
@@ -1300,6 +1542,9 @@ func writePrivateFileAtomic(path string, data []byte) error {
 	}
 	if err := os.Rename(temporaryPath, path); err != nil {
 		return fmt.Errorf("replace private file: %w", err)
+	}
+	if err := syncDirectory(directory); err != nil {
+		return fmt.Errorf("sync private file directory: %w", err)
 	}
 	return nil
 }

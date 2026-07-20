@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/buberlo/apple-pod-control/internal/cluster"
 )
 
 const DefaultPlatform = "linux/arm64"
@@ -43,6 +45,8 @@ type commandRunner interface {
 	Run(context.Context, io.Reader, io.Writer, io.Writer, string, ...string) error
 }
 
+type targetResolver func(ctx context.Context, clusterName, containerBinary string) ([]string, error)
+
 type execRunner struct{}
 
 func (execRunner) Run(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer, binary string, arguments ...string) error {
@@ -54,11 +58,19 @@ func (execRunner) Run(ctx context.Context, stdin io.Reader, stdout, stderr io.Wr
 }
 
 type Manager struct {
-	runner commandRunner
+	runner         commandRunner
+	resolveTargets targetResolver
 }
 
 func NewManager() *Manager {
-	return &Manager{runner: execRunner{}}
+	return &Manager{
+		runner:         execRunner{},
+		resolveTargets: resolveLocalTargets,
+	}
+}
+
+func resolveLocalTargets(ctx context.Context, name, containerBinary string) ([]string, error) {
+	return cluster.NewManager(containerBinary).ImageImportTargets(ctx, name)
 }
 
 func (m *Manager) Transfer(ctx context.Context, options Options) (Result, error) {
@@ -67,6 +79,17 @@ func (m *Manager) Transfer(ctx context.Context, options Options) (Result, error)
 		return Result{}, err
 	}
 	result := Result{Images: append([]string(nil), options.Images...)}
+	resolveTargets := m.resolveTargets
+	if resolveTargets == nil {
+		resolveTargets = resolveLocalTargets
+	}
+	localTargets, err := resolveTargets(ctx, options.Cluster, options.ContainerBinary)
+	if err != nil {
+		return result, fmt.Errorf("resolve local image import targets for cluster %q: %w", options.Cluster, err)
+	}
+	if len(localTargets) == 0 {
+		return result, fmt.Errorf("cluster %q has no validated local image import targets", options.Cluster)
+	}
 	for _, image := range options.Images {
 		if !options.Pull {
 			continue
@@ -100,11 +123,12 @@ func (m *Manager) Transfer(ctx context.Context, options Options) (Result, error)
 	}
 	result.ArchiveBytes = archiveInfo.Size()
 
-	serverContainer := "apc-k3s-" + options.Cluster + "-server"
-	if err := m.importLocal(ctx, options, archive, serverContainer); err != nil {
-		return result, err
+	for _, target := range localTargets {
+		if err := m.importLocal(ctx, options, archive, target); err != nil {
+			return result, err
+		}
+		result.Targets = append(result.Targets, target)
 	}
-	result.Targets = append(result.Targets, serverContainer)
 
 	agentContainer := "apc-k3s-" + options.Cluster + "-agent"
 	for _, peer := range options.Peers {
@@ -124,16 +148,16 @@ func (m *Manager) importLocal(ctx context.Context, options Options, archive, con
 	defer file.Close()
 	if err := m.runner.Run(ctx, file, options.Stdout, options.Stderr, options.ContainerBinary,
 		"exec", "-i", containerName, "ctr", "-n", "k8s.io", "images", "import", "--platform", options.Platform, "-"); err != nil {
-		return fmt.Errorf("import images into local K3s node: %w", err)
+		return fmt.Errorf("import images into local K3s node %q: %w", containerName, err)
 	}
 	for _, image := range options.Images {
 		var output bytes.Buffer
 		arguments := []string{"exec", containerName, "ctr", "-n", "k8s.io", "images", "list", "-q", "name==" + image}
 		if err := m.runner.Run(ctx, nil, &output, options.Stderr, options.ContainerBinary, arguments...); err != nil {
-			return fmt.Errorf("verify image %q on local K3s node: %w", image, err)
+			return fmt.Errorf("verify image %q on local K3s node %q: %w", image, containerName, err)
 		}
 		if strings.TrimSpace(output.String()) != image {
-			return fmt.Errorf("image %q was not found on local K3s node after import", image)
+			return fmt.Errorf("image %q was not found on local K3s node %q after import", image, containerName)
 		}
 		fmt.Fprintf(options.Stdout, "verified %s on %s\n", image, containerName)
 	}

@@ -227,6 +227,9 @@ func RenderLaunchDaemon(config Config) []byte {
 }
 
 func installHelper(source string) error {
+	if err := ensurePrivilegedHelperDirectory(); err != nil {
+		return err
+	}
 	input, err := os.Open(source)
 	if err != nil {
 		return fmt.Errorf("open APC executable: %w", err)
@@ -259,6 +262,37 @@ func installHelper(source string) error {
 	}
 	if err := os.Rename(temporaryPath, helperPath); err != nil {
 		return fmt.Errorf("publish privileged helper: %w", err)
+	}
+	return nil
+}
+
+func ensurePrivilegedHelperDirectory() error {
+	directory := filepath.Dir(helperPath)
+	info, err := os.Lstat(directory)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := os.Mkdir(directory, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("create privileged helper directory: %w", err)
+		}
+		if err := os.Chown(directory, 0, 0); err != nil {
+			return fmt.Errorf("own privileged helper directory: %w", err)
+		}
+		if err := os.Chmod(directory, 0o755); err != nil {
+			return fmt.Errorf("protect privileged helper directory: %w", err)
+		}
+		info, err = os.Lstat(directory)
+	}
+	if err != nil {
+		return fmt.Errorf("inspect privileged helper directory: %w", err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("privileged helper directory %s is not a real directory", directory)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != 0 || stat.Gid != 0 {
+		return fmt.Errorf("privileged helper directory %s must be owned by root:wheel", directory)
+	}
+	if info.Mode().Perm() != 0o755 {
+		return fmt.Errorf("privileged helper directory %s has mode %04o, expected 0755", directory, info.Mode().Perm())
 	}
 	return nil
 }

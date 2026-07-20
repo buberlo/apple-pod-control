@@ -9,8 +9,17 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+)
+
+const (
+	haProxySupervisorInitialRetry = time.Second
+	haProxySupervisorMaximumRetry = 30 * time.Second
+	haRepairInitialBackoff        = 30 * time.Second
+	haRepairMaximumBackoff        = 5 * time.Minute
+	haSupervisorDefaultInterval   = 15 * time.Second
 )
 
 type SuperviseOptions struct {
@@ -20,17 +29,21 @@ type SuperviseOptions struct {
 	Output   io.Writer
 }
 
-// Supervise continuously keeps the Apple container service and one APC node
-// running. launchd restarts this loop if the process itself fails.
+// Supervise continuously keeps the Apple container service and one APC node,
+// or the complete local HA member set, running. launchd restarts this loop if
+// the process itself fails.
 func (m *Manager) Supervise(ctx context.Context, options SuperviseOptions) error {
-	if options.Role != "server" && options.Role != "agent" {
-		return fmt.Errorf("role must be server or agent")
+	if ctx == nil {
+		return fmt.Errorf("supervisor context is nil")
+	}
+	if options.Role != "server" && options.Role != "agent" && options.Role != "ha" {
+		return fmt.Errorf("role must be server, agent, or ha")
 	}
 	if !dnsLabel.MatchString(options.Name) {
 		return fmt.Errorf("cluster name must be a lowercase DNS label")
 	}
 	if options.Interval == 0 {
-		options.Interval = 15 * time.Second
+		options.Interval = haSupervisorDefaultInterval
 	}
 	if options.Interval < 5*time.Second {
 		return fmt.Errorf("supervisor interval must be at least 5s")
@@ -38,8 +51,62 @@ func (m *Manager) Supervise(ctx context.Context, options SuperviseOptions) error
 	if options.Output == nil {
 		options.Output = io.Discard
 	}
-	if err := m.reconcileSupervisedNode(ctx, options); err != nil {
-		fmt.Fprintf(options.Output, "%s reconcile failed: %v\n", time.Now().UTC().Format(time.RFC3339), err)
+	return m.supervise(ctx, options, supervisorRuntime{
+		reconcile:         m.reconcileSupervisedNode,
+		reconcileHA:       m.reconcileSupervisedHA,
+		serveHAProxy:      m.ServeHAProxy,
+		proxyInitialRetry: haProxySupervisorInitialRetry,
+		proxyMaximumRetry: haProxySupervisorMaximumRetry,
+	})
+}
+
+type supervisorRuntime struct {
+	reconcile         func(context.Context, SuperviseOptions) error
+	reconcileHA       func(context.Context, SuperviseOptions, *haSupervisorState) error
+	serveHAProxy      func(context.Context, string) error
+	proxyInitialRetry time.Duration
+	proxyMaximumRetry time.Duration
+}
+
+type supervisorLogger struct {
+	mu     sync.Mutex
+	output io.Writer
+}
+
+func (l *supervisorLogger) printf(format string, arguments ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	fmt.Fprintf(l.output, "%s "+format+"\n", append([]any{time.Now().UTC().Format(time.RFC3339)}, arguments...)...)
+}
+
+func (m *Manager) supervise(ctx context.Context, options SuperviseOptions, runtime supervisorRuntime) error {
+	logger := &supervisorLogger{output: options.Output}
+	haState := newHASupervisorState()
+	reconcile := func() error {
+		if options.Role == "ha" && runtime.reconcileHA != nil {
+			return runtime.reconcileHA(ctx, options, haState)
+		}
+		return runtime.reconcile(ctx, options)
+	}
+	var stopProxy context.CancelFunc
+	var proxyDone <-chan struct{}
+	if options.Role == "ha" {
+		proxyCtx, cancelProxy := context.WithCancel(ctx)
+		done := make(chan struct{})
+		stopProxy = cancelProxy
+		proxyDone = done
+		go func() {
+			defer close(done)
+			superviseHAProxy(proxyCtx, options.Name, runtime, logger)
+		}()
+		defer func() {
+			stopProxy()
+			<-proxyDone
+		}()
+	}
+
+	if err := reconcile(); err != nil {
+		logger.printf("reconcile failed: %v", err)
 	}
 	ticker := time.NewTicker(options.Interval)
 	defer ticker.Stop()
@@ -48,18 +115,61 @@ func (m *Manager) Supervise(ctx context.Context, options SuperviseOptions) error
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			if err := m.reconcileSupervisedNode(ctx, options); err != nil {
-				fmt.Fprintf(options.Output, "%s reconcile failed: %v\n", time.Now().UTC().Format(time.RFC3339), err)
+			if err := reconcile(); err != nil {
+				logger.printf("reconcile failed: %v", err)
+			}
+		}
+	}
+}
+
+func superviseHAProxy(ctx context.Context, name string, runtime supervisorRuntime, logger *supervisorLogger) {
+	retry := runtime.proxyInitialRetry
+	if retry <= 0 {
+		retry = haProxySupervisorInitialRetry
+	}
+	maximumRetry := runtime.proxyMaximumRetry
+	if maximumRetry < retry {
+		maximumRetry = retry
+	}
+	for {
+		err := runtime.serveHAProxy(ctx, name)
+		if ctx.Err() != nil {
+			return
+		}
+		if err == nil {
+			logger.printf("HA API proxy stopped unexpectedly; retrying in %s", retry)
+		} else {
+			logger.printf("HA API proxy failed: %v; retrying in %s", err, retry)
+		}
+
+		timer := time.NewTimer(retry)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		case <-timer.C:
+		}
+		if retry < maximumRetry {
+			if retry > maximumRetry/2 {
+				retry = maximumRetry
+			} else {
+				retry *= 2
 			}
 		}
 	}
 }
 
 func (m *Manager) reconcileSupervisedNode(ctx context.Context, options SuperviseOptions) error {
-	if _, stderr, err := m.runner.Run(ctx, m.binary, "system", "status"); err != nil {
-		if _, startStderr, startErr := m.runner.Run(ctx, m.binary, "system", "start"); startErr != nil {
-			return errors.Join(commandError("read Apple container service status", stderr, err), commandError("start Apple container service", startStderr, startErr))
-		}
+	if err := m.ensureAppleContainerService(ctx); err != nil {
+		return err
+	}
+	if options.Role == "ha" {
+		return m.reconcileSupervisedHAAfterService(ctx, options, newHASupervisorState())
 	}
 	if options.Role == "agent" {
 		state, err := m.AgentStatus(ctx, options.Name)
@@ -75,6 +185,307 @@ func (m *Manager) reconcileSupervisedNode(ctx context.Context, options Supervise
 	}
 	_, startErr := m.Start(ctx, options.Name, 2*time.Minute)
 	return startErr
+}
+
+func (m *Manager) ensureAppleContainerService(ctx context.Context) error {
+	if _, stderr, err := m.runner.Run(ctx, m.binary, "system", "status"); err != nil {
+		if _, startStderr, startErr := m.runner.Run(ctx, m.binary, "system", "start"); startErr != nil {
+			return errors.Join(commandError("read Apple container service status", stderr, err), commandError("start Apple container service", startStderr, startErr))
+		}
+	}
+	return nil
+}
+
+type haRepairBackoff struct {
+	failures int
+	next     time.Time
+}
+
+type haSupervisorState struct {
+	now          func() time.Time
+	repairs      map[int]haRepairBackoff
+	startupUntil map[int]time.Time
+}
+
+func newHASupervisorState() *haSupervisorState {
+	return &haSupervisorState{
+		now:          time.Now,
+		repairs:      make(map[int]haRepairBackoff),
+		startupUntil: make(map[int]time.Time),
+	}
+}
+
+func (state *haSupervisorState) repairAllowed(id int) bool {
+	return !state.now().Before(state.repairs[id].next)
+}
+
+func (state *haSupervisorState) recordRepair(id int, err error) {
+	if err == nil {
+		delete(state.repairs, id)
+		return
+	}
+	entry := state.repairs[id]
+	entry.failures++
+	delay := haRepairInitialBackoff
+	for attempt := 1; attempt < entry.failures && delay < haRepairMaximumBackoff; attempt++ {
+		if delay > haRepairMaximumBackoff/2 {
+			delay = haRepairMaximumBackoff
+		} else {
+			delay *= 2
+		}
+	}
+	entry.next = state.now().Add(delay)
+	state.repairs[id] = entry
+}
+
+func (state *haSupervisorState) recordStartup(id int, grace time.Duration) {
+	if grace <= 0 {
+		grace = haSupervisorDefaultInterval
+	}
+	until := state.now().Add(grace)
+	if until.After(state.startupUntil[id]) {
+		state.startupUntil[id] = until
+	}
+}
+
+func (state *haSupervisorState) startupInProgress(id int) bool {
+	return state.now().Before(state.startupUntil[id])
+}
+
+func (state *haSupervisorState) clearStartup(id int) {
+	delete(state.startupUntil, id)
+}
+
+func (m *Manager) reconcileSupervisedHA(ctx context.Context, options SuperviseOptions, supervisor *haSupervisorState) error {
+	reconcileCtx, cancel := context.WithTimeout(ctx, haSupervisorReconcileTimeout(options.Interval))
+	defer cancel()
+	if err := m.ensureAppleContainerService(reconcileCtx); err != nil {
+		return err
+	}
+	return m.reconcileSupervisedHAAfterService(reconcileCtx, options, supervisor)
+}
+
+func (m *Manager) reconcileSupervisedHAAfterService(ctx context.Context, options SuperviseOptions, supervisor *haSupervisorState) (err error) {
+	reconcileCtx, cancel := context.WithTimeout(ctx, haSupervisorReconcileTimeout(options.Interval))
+	defer cancel()
+	ctx = reconcileCtx
+	lock, err := acquireHALifecycleOperationLock(ctx, options.Name)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, lock.release()) }()
+	config, err := loadHAConfig(options.Name)
+	if err != nil {
+		return err
+	}
+	if err := ensureHARecoveryJournalAllowsSupervision(config.Name); err != nil {
+		return err
+	}
+	desired, err := loadHADesiredState(config.Name)
+	if err != nil {
+		return err
+	}
+	if desired.ClusterState == haDesiredStopped {
+		// A crash can occur after durable stop intent is written but before all
+		// three stop calls complete. Keep reconciling toward fully stopped while
+		// never reconstructing a missing keep-data envelope.
+		return m.stopHALocked(ctx, config.Name)
+	}
+	state, err := m.StatusHA(ctx, config.Name)
+	if err != nil {
+		return err
+	}
+	if len(desired.StoppedMembers) == 1 {
+		intentionalID := desired.StoppedMembers[0]
+		intentional, found := haMemberStateByID(state, intentionalID)
+		if !found {
+			return fmt.Errorf("HA status omitted intentionally stopped member %d", intentionalID)
+		}
+		if allHAMembersReady(state) {
+			_, _, stopErr := m.stopHAMemberLocked(ctx, config, memberByID(config.Members, intentionalID))
+			return stopErr
+		}
+		if otherHAMembersReady(state, intentionalID) {
+			if strings.EqualFold(intentional.RuntimeState, "running") {
+				return m.stopIntentionalUnhealthyHAMemberLocked(ctx, config, memberByID(config.Members, intentionalID), state)
+			}
+			return nil
+		}
+		return m.reconcileHAWithIntentionalMemberStop(ctx, config, state, intentionalID)
+	}
+	if allHAMembersReady(state) {
+		for _, member := range state.Members {
+			supervisor.recordRepair(member.ID, nil)
+			supervisor.clearStartup(member.ID)
+		}
+		return nil
+	}
+	unready := make([]HAMemberState, 0, haMemberCount)
+	for _, member := range state.Members {
+		if !member.NodeReady || !member.APIReady || !strings.EqualFold(member.RuntimeState, "running") {
+			unready = append(unready, member)
+		}
+	}
+	if len(unready) != 1 {
+		for _, member := range unready {
+			if !strings.EqualFold(member.RuntimeState, "running") {
+				supervisor.recordStartup(member.ID, config.StartupTimeout)
+			}
+		}
+		_, startErr := m.startHALocked(ctx, config.Name, 3*time.Minute)
+		return startErr
+	}
+	targetState := unready[0]
+	target := memberByID(config.Members, targetState.ID)
+	if !otherHAMembersReady(state, target.ID) {
+		return fmt.Errorf("cannot safely reconcile HA member %d: the other two node/API pairs are not Ready", target.ID)
+	}
+	if !strings.EqualFold(targetState.RuntimeState, "running") {
+		supervisor.recordStartup(target.ID, config.StartupTimeout)
+		_, startErr := m.startHAMemberLocked(ctx, config, target)
+		return startErr
+	}
+	if supervisor.startupInProgress(target.ID) {
+		return nil
+	}
+	if !supervisor.repairAllowed(target.ID) {
+		return nil
+	}
+	repairErr := m.restartUnhealthyHAMemberLocked(ctx, config, target)
+	supervisor.recordRepair(target.ID, repairErr)
+	return repairErr
+}
+
+func ensureHARecoveryJournalAllowsSupervision(name string) error {
+	journal, err := LoadHARecoveryState(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("refusing HA supervision because the protected recovery journal cannot be trusted: %w", err)
+	}
+	runtimeSafe := journal.RecoverySucceeded &&
+		(journal.Phase == "completed" || (journal.Phase == "failed" && journal.RecoveryAttempted))
+	if runtimeSafe {
+		return nil
+	}
+	action := fmt.Sprintf("rerun `apc cluster ha restore %s --from %q --yes` to resume or retry recovery", name, journal.SnapshotPath)
+	return fmt.Errorf("refusing HA VM reconciliation while recovery journal is in nonterminal phase %q (recoverySucceeded=%t); %s", journal.Phase, journal.RecoverySucceeded, action)
+}
+
+func (m *Manager) stopIntentionalUnhealthyHAMemberLocked(ctx context.Context, config HAConfig, member HAMember, state HAState) error {
+	if !otherHAMembersReady(state, member.ID) {
+		return fmt.Errorf("refusing to enforce intentional stop for HA member %d without two Ready peers", member.ID)
+	}
+	preflight, err := m.preflightHAMemberTopology(ctx, config, member.ID, true)
+	if err != nil {
+		return err
+	}
+	record, exists := preflight.containerRecord[member.ID]
+	if !exists || !strings.EqualFold(record.Status.State, "running") {
+		return nil
+	}
+	if _, err := m.validateHAEtcdRepairQuorum(ctx, config, member.ID); err != nil {
+		return fmt.Errorf("refusing to enforce intentional stop for unhealthy HA member %d without a proven two-voter etcd majority: %w", member.ID, err)
+	}
+	if err := m.runHABounded(ctx, fmt.Sprintf("stop intentionally disabled unhealthy HA server member %d", member.ID), "stop", HAContainerName(config.Name, member.ID)); err != nil {
+		return err
+	}
+	_, err = m.waitHAMemberStopped(ctx, config, member)
+	return err
+}
+
+func (m *Manager) reconcileHAWithIntentionalMemberStop(ctx context.Context, config HAConfig, state HAState, intentionalID int) error {
+	var target *HAMemberState
+	for index := range state.Members {
+		member := &state.Members[index]
+		if member.ID == intentionalID {
+			continue
+		}
+		if !member.NodeReady || !member.APIReady || !strings.EqualFold(member.RuntimeState, "running") {
+			if target != nil {
+				return fmt.Errorf("multiple HA members are unavailable while member %d is intentionally stopped", intentionalID)
+			}
+			target = member
+		}
+	}
+	if target == nil {
+		return fmt.Errorf("intentionally stopped HA member %d has not reached a stable two-member state", intentionalID)
+	}
+	if strings.EqualFold(target.RuntimeState, "running") {
+		return fmt.Errorf("HA member %d is running but unhealthy while member %d is intentionally stopped; refusing a no-quorum restart", target.ID, intentionalID)
+	}
+	preflight, err := m.preflightHAMemberTopology(ctx, config, target.ID, true)
+	if err != nil {
+		return err
+	}
+	record := preflight.containerRecord[target.ID]
+	member := memberByID(config.Members, target.ID)
+	if err := m.reconcileHAMember(ctx, config, member, record); err != nil {
+		return err
+	}
+	return m.waitHAMemberReady(ctx, config, member, config.StartupTimeout)
+}
+
+func (m *Manager) restartUnhealthyHAMemberLocked(ctx context.Context, config HAConfig, member HAMember) (err error) {
+	if _, err := m.preflightHAMemberTopology(ctx, config, member.ID, false); err != nil {
+		return err
+	}
+	state, err := m.StatusHA(ctx, config.Name)
+	if err != nil {
+		return err
+	}
+	if !otherHAMembersReady(state, member.ID) {
+		return fmt.Errorf("refusing to repair unhealthy HA member %d without two Ready peers", member.ID)
+	}
+	if _, err := m.validateHAEtcdRepairQuorum(ctx, config, member.ID); err != nil {
+		return fmt.Errorf("refusing to repair unhealthy HA member %d without a proven two-voter embedded-etcd majority: %w", member.ID, err)
+	}
+	restartNeeded := true
+	defer func() {
+		if err == nil || !restartNeeded {
+			return
+		}
+		recoveryTimeout := config.StartupTimeout
+		if recoveryTimeout <= 0 || recoveryTimeout > haRecoveryAttemptTimeout {
+			recoveryTimeout = haRecoveryAttemptTimeout
+		}
+		recoveryCtx, cancelRecovery := context.WithTimeout(ctx, recoveryTimeout)
+		defer cancelRecovery()
+		_, recoveryErr := m.startHAMemberLocked(recoveryCtx, config, member)
+		if recoveryErr != nil {
+			err = errors.Join(err, fmt.Errorf("recover unhealthy HA member %d after failed supervisor repair: %w", member.ID, recoveryErr))
+		}
+	}()
+	if err := m.runHABounded(ctx, fmt.Sprintf("stop unhealthy HA server member %d", member.ID), "stop", HAContainerName(config.Name, member.ID)); err != nil {
+		return err
+	}
+	if _, err := m.waitHAMemberStopped(ctx, config, member); err != nil {
+		return err
+	}
+	if _, err := m.startHAMemberLocked(ctx, config, member); err != nil {
+		return err
+	}
+	restartNeeded = false
+	return nil
+}
+
+func haSupervisorReconcileTimeout(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		interval = haSupervisorDefaultInterval
+	}
+	timeout := interval - interval/5
+	maximum := haRuntimeOperationTimeout - time.Second
+	if maximum <= 0 {
+		maximum = haRuntimeOperationTimeout
+	}
+	if timeout > maximum {
+		timeout = maximum
+	}
+	if timeout <= 0 {
+		timeout = time.Second
+	}
+	return timeout
 }
 
 // DeleteServer removes the local server VM envelope. When keepData is false,

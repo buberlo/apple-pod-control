@@ -5,10 +5,12 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -137,31 +139,82 @@ func (m *Manager) Diagnose(ctx context.Context, name string, options DiagnoseOpt
 		report.Results = append(report.Results, DiagnosticResult{Name: check, Status: status, Detail: detail, Remediation: remediation})
 	}
 
-	state, statusErr := m.Status(diagnosticCtx, name)
-	if statusErr != nil {
-		add("control-plane", DiagnosticFail, conciseError(statusErr), "run: apc cluster status "+name)
-		return report, nil
-	}
-	if !strings.EqualFold(state.RuntimeState, "running") {
-		add("control-plane", DiagnosticFail, "Apple VM is "+state.RuntimeState, "run: apc cluster start "+name)
-		return report, nil
-	}
-	if state.NodeReady {
-		add("control-plane", DiagnosticPass, fmt.Sprintf("%s is Kubernetes Ready (%s)", state.NodeName, state.K3sVersion), "")
-	} else {
-		add("control-plane", DiagnosticFail, state.NodeName+" is not Kubernetes Ready", "inspect K3s and kubelet logs")
-	}
-
-	if endpoint, parseErr := url.Parse(state.APIEndpoint); parseErr != nil || endpoint.Host == "" {
-		add("host-api", DiagnosticFail, "invalid published API endpoint "+state.APIEndpoint, "recreate the server node")
-	} else {
-		probeCtx, probeCancel := context.WithTimeout(diagnosticCtx, options.ProbeTimeout)
-		dialErr := m.dialTCP(probeCtx, endpoint.Host)
-		probeCancel()
-		if dialErr != nil {
-			add("host-api", DiagnosticFail, conciseError(dialErr), "verify the published API port and host firewall")
+	haConfig, haConfigErr := loadHAConfig(name)
+	switch {
+	case haConfigErr == nil:
+		haState, statusErr := m.StatusHA(diagnosticCtx, name)
+		if statusErr != nil {
+			add("control-plane", DiagnosticFail, conciseError(statusErr), "run: apc cluster ha status "+name)
+			return report, nil
+		}
+		for _, member := range haState.Members {
+			memberName := member.NodeName
+			if memberName == "" {
+				memberName = "member-" + strconv.Itoa(member.ID)
+			}
+			if strings.EqualFold(member.RuntimeState, "running") {
+				add("ha-runtime/"+memberName, DiagnosticPass, member.Container+" is running", "")
+			} else {
+				add("ha-runtime/"+memberName, DiagnosticFail, member.Container+" is "+member.RuntimeState, "run: apc cluster ha start "+name)
+			}
+			if member.APIReady {
+				add("host-api/"+memberName, DiagnosticPass, member.APIEndpoint+" is Ready", "")
+			} else {
+				add("host-api/"+memberName, DiagnosticFail, member.APIEndpoint+" is not Ready", "verify the published API port, TLS credentials and member logs")
+			}
+			if member.NodeReady {
+				detail := memberName + " is Kubernetes Ready"
+				if member.K3sVersion != "" {
+					detail += " (" + member.K3sVersion + ")"
+				}
+				add("ha-node/"+memberName, DiagnosticPass, detail, "")
+			} else {
+				add("ha-node/"+memberName, DiagnosticFail, memberName+" is not Kubernetes Ready", "inspect K3s and kubelet logs")
+			}
+		}
+		quorumDetail := fmt.Sprintf("%d/%d Ready node/API pairs; quorum requires %d", haState.ReadyMembers, len(haState.Members), haState.Quorum)
+		if haState.Healthy {
+			add("etcd-quorum", DiagnosticPass, quorumDetail, "")
 		} else {
-			add("host-api", DiagnosticPass, endpoint.Host+" accepts TCP connections", "")
+			add("etcd-quorum", DiagnosticFail, quorumDetail, "restore at least "+strconv.Itoa(haState.Quorum)+" HA members before running workload probes")
+			return report, nil
+		}
+		etcdTopology, topologyErr := m.validateHAEtcdTopology(diagnosticCtx, haConfig)
+		if topologyErr != nil {
+			add("etcd-topology", DiagnosticFail, conciseError(topologyErr), "repair embedded-etcd membership before creating diagnostic workloads or stopping a member")
+			return report, nil
+		}
+		add("etcd-topology", DiagnosticPass, fmt.Sprintf("%d unique healthy voting members with exact peer topology", len(etcdTopology.Members)), "")
+	case !errors.Is(haConfigErr, os.ErrNotExist):
+		add("control-plane", DiagnosticFail, conciseError(haConfigErr), "repair the protected HA cluster configuration")
+		return report, nil
+	default:
+		state, statusErr := m.Status(diagnosticCtx, name)
+		if statusErr != nil {
+			add("control-plane", DiagnosticFail, conciseError(statusErr), "run: apc cluster status "+name)
+			return report, nil
+		}
+		if !strings.EqualFold(state.RuntimeState, "running") {
+			add("control-plane", DiagnosticFail, "Apple VM is "+state.RuntimeState, "run: apc cluster start "+name)
+			return report, nil
+		}
+		if state.NodeReady {
+			add("control-plane", DiagnosticPass, fmt.Sprintf("%s is Kubernetes Ready (%s)", state.NodeName, state.K3sVersion), "")
+		} else {
+			add("control-plane", DiagnosticFail, state.NodeName+" is not Kubernetes Ready", "inspect K3s and kubelet logs")
+		}
+
+		if endpoint, parseErr := url.Parse(state.APIEndpoint); parseErr != nil || endpoint.Host == "" {
+			add("host-api", DiagnosticFail, "invalid published API endpoint "+state.APIEndpoint, "recreate the server node")
+		} else {
+			probeCtx, probeCancel := context.WithTimeout(diagnosticCtx, options.ProbeTimeout)
+			dialErr := m.dialTCP(probeCtx, endpoint.Host)
+			probeCancel()
+			if dialErr != nil {
+				add("host-api", DiagnosticFail, conciseError(dialErr), "verify the published API port and host firewall")
+			} else {
+				add("host-api", DiagnosticPass, endpoint.Host+" accepts TCP connections", "")
+			}
 		}
 	}
 
@@ -238,6 +291,9 @@ func (m *Manager) Diagnose(ctx context.Context, name string, options DiagnoseOpt
 	pods := make([]diagnosticPod, 0, len(readyNodes))
 	for index, node := range readyNodes {
 		podName := fmt.Sprintf("%s-%d", resourcePrefix, index)
+		// Register the exact name before creation. A timed-out kubectl request may
+		// have reached the API server even when its caller observed an error.
+		resources = append(resources, "pod/"+podName)
 		overrides, marshalErr := json.Marshal(map[string]any{
 			"apiVersion": "v1",
 			"spec": map[string]any{
@@ -260,7 +316,6 @@ func (m *Manager) Diagnose(ctx context.Context, name string, options DiagnoseOpt
 			add("probe-pod/"+node.Metadata.Name, DiagnosticFail, conciseError(runErr), "inspect image availability and node admission")
 			continue
 		}
-		resources = append(resources, "pod/"+podName)
 		waitTimeout := options.Timeout / 2
 		if waitTimeout > time.Minute {
 			waitTimeout = time.Minute
@@ -330,11 +385,11 @@ func (m *Manager) Diagnose(ctx context.Context, name string, options DiagnoseOpt
 		}
 	}
 
+	resources = append(resources, "service/"+resourcePrefix)
 	if _, exposeErr := m.diagnosticKubectl(diagnosticCtx, name, "expose", "pod", pods[0].Name, "-n", report.Namespace, "--name", resourcePrefix, "--port", "80", "--target-port", "80"); exposeErr != nil {
 		add("clusterip", DiagnosticFail, conciseError(exposeErr), "inspect Service admission")
 		return report, nil
 	}
-	resources = append(resources, "service/"+resourcePrefix)
 	serviceAddress := "http://" + resourcePrefix + "." + report.Namespace + ".svc.cluster.local/"
 	for _, pod := range pods {
 		check := "clusterip/" + pod.Node
@@ -350,6 +405,15 @@ func (m *Manager) Diagnose(ctx context.Context, name string, options DiagnoseOpt
 }
 
 func (m *Manager) diagnosticKubectl(ctx context.Context, name string, arguments ...string) ([]byte, error) {
+	if _, haErr := loadHAConfig(name); haErr == nil {
+		stdout, stderr, err := m.Kubectl(ctx, name, arguments...)
+		if err != nil {
+			return stdout, commandError("kubectl "+strings.Join(arguments, " "), stderr, err)
+		}
+		return stdout, nil
+	} else if !errors.Is(haErr, os.ErrNotExist) {
+		return nil, haErr
+	}
 	commandArguments := append([]string{"exec", ContainerName(name), "kubectl"}, arguments...)
 	stdout, stderr, err := m.runner.Run(ctx, m.binary, commandArguments...)
 	if err != nil {

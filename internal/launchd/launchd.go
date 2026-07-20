@@ -170,8 +170,8 @@ func Label(config Config) string {
 }
 
 func normalizeConfig(config Config) (Config, error) {
-	if config.Role != "server" && config.Role != "agent" {
-		return Config{}, fmt.Errorf("role must be server or agent")
+	if config.Role != "server" && config.Role != "agent" && config.Role != "ha" {
+		return Config{}, fmt.Errorf("role must be server, agent, or ha")
 	}
 	if !safeName.MatchString(config.Cluster) {
 		return Config{}, fmt.Errorf("cluster name must be a lowercase DNS label")

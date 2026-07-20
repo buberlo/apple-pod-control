@@ -9,10 +9,10 @@ work targets v2; v1 remains available through `apc --legacy`.
 ## High-level diagram
 
 APC v2 follows the Kubernetes control-plane boundary rather than reimplementing
-its APIs:
+its APIs. The physical two-Mac worker topology is:
 
 ```text
- apc / kubectl / Helm ── kubeconfig ──> K3s API, controllers, scheduler, SQLite
+ apc / kubectl / apc helm ── kubeconfig ──> K3s API, controllers, scheduler
                                                 │
                          ┌──────────────────────┴──────────────────────┐
                          v                                             v
@@ -23,6 +23,33 @@ its APIs:
  APC lifecycle: labelled volumes, backup/restore, digest upgrade, image sync,
                 deep doctor and Background LaunchAgent supervision
 ```
+
+The separate local HA topology keeps three K3s/embedded-etcd servers on one
+Mac and exposes them through a stable loopback TLS-pass-through proxy:
+
+```text
+ apc / kubectl / apc helm
+             │ protected kubeconfig
+             v
+ https://127.0.0.1:17442
+ APC HA proxy (TLS remains end to end)
+       │ health-aware new connections
+       ├──────────────┬──────────────┐
+       v              v              v
+ server VM 1      server VM 2      server VM 3
+ K3s + etcd       K3s + etcd       K3s + etcd
+ volume 1         volume 2         volume 3
+
+ One physical Mac and therefore one physical failure domain
+```
+
+The HA Background LaunchAgent runs member reconciliation and the proxy
+concurrently. Kubeconfig preparation authenticates and prefers the stable proxy
+and falls back to a reachable Ready member when it is not serving. The proxy
+does not terminate or inspect Kubernetes TLS. Reconciliation reads a private,
+durable desired-state record under the same per-cluster operation lock used by
+HA lifecycle commands. Proxy retry remains independent, so a blocked member
+reconcile does not terminate the proxy loop.
 
 The original v1 component model remains:
 
@@ -68,11 +95,45 @@ The original v1 component model remains:
 | Rollouts | `RollingUpdate` (`maxSurge`, `maxUnavailable`) and `Recreate` |
 | kubectl-style UX | `apply`, `get`, `describe`, `delete`, `scale`, `rollout status`, `-n`, `-o` |
 
-APC intentionally omits admission webhooks, CRDs, multi-container Pods,
-Services/Ingress, distributed consensus and cloud-provider integrations in the
-MVP. SQLite provides excellent single-control-plane latency but not HA. The API
-and controller boundaries allow SQLite to be replaced by an etcd-backed store
-when multi-control-plane availability becomes necessary.
+APC v1 intentionally omits admission webhooks, CRDs, multi-container Pods,
+Services/Ingress, distributed consensus and cloud-provider integrations.
+SQLite provides excellent single-control-plane latency but not v1 control-plane
+HA. APC v2 delegates those Kubernetes APIs to K3s; its local three-server mode
+uses K3s embedded etcd, without changing the physical one-Mac fault boundary.
+
+## APC v2 lifecycle and HA invariants
+
+| Concern | Behavior |
+|---|---|
+| Helm | `apc helm` invokes native Helm with the selected protected kubeconfig; direct Helm remains supported |
+| Stable HA API | Default loopback TLS-pass-through endpoint `127.0.0.1:17442`, health-aware backends and authenticated direct-member fallback |
+| Persistent HA intent | Private per-cluster desired state records whole-cluster `Running`/`Stopped` plus at most one intentionally stopped member; start clears the applicable stop intent before reconciliation |
+| Member maintenance | Only one member is intentionally stopped; quorum-reducing stop/restart requires 3/3 node/API readiness and exact healthy three-member etcd topology, while start requires the other two node/API pairs Ready |
+| Supervisor repair | Intentional stops are preserved across ticks and process restarts; without stop intent, exactly one running-but-unhealthy member may be replaced only after a two-voter etcd-majority proof, with exponential backoff after failure |
+| Operation serialization | Snapshot, restore and member lifecycle share a private per-cluster cross-process lock |
+| HA image transport | All three exact running member targets are resolved before one ARM64 archive is imported and verified everywhere |
+| HA diagnostics | Runtime, API, Node and exact embedded-etcd health/topology checks precede per-node DNS, egress, Pod-network and Service probes |
+| HA snapshot | Exact healthy three-member etcd topology gates a native K3s snapshot plus matching server token and immutable checksum/topology manifest outside member volumes |
+| HA restore | Destructive in-place rollback requiring saved configuration, matching current token, exact network and all three original volumes |
+| Restore interlock | Any nonterminal, unsuccessful or untrusted recovery journal blocks automatic VM mutation; only completed recovery or a failed restore whose automatic recovery succeeded is runtime-safe |
+| Runtime IPv4 guard | Detect primary-address collisions caused by apple/container's MAC-independent allocation before K3s/etcd mutation; delete only exact owned envelopes and retry within fixed bounds |
+| Legacy envelope migration | Recognize only the immediately preceding exact launch identity and replace one member at a time while preserving quorum |
+
+The full etcd proof comes from every member's loopback health endpoint and
+metrics, not from Kubernetes readiness. APC requires three unique server IDs,
+current health, an elected leader, non-learner voters and exact peer sets that
+name the other two members. Repairing an unavailable target uses a narrower
+proof from the two non-target voters: both must be healthy voting members,
+mutually identify one another and agree on the target's third server ID. This
+allows the failed target itself to be unreachable without weakening the
+two-voter majority requirement.
+
+The restore path is not replacement-host disaster recovery. A snapshot package
+cannot recreate a lost Mac, replace the saved topology or recover three missing
+member volumes. The included K3s server token is a credential and cryptographic
+recovery dependency; off-host packages require encryption and strict access
+control. The current command also requires the present on-host token file to
+match the packaged copy, so token-loss recovery remains open.
 
 ## Reconciliation and failure handling
 
@@ -125,8 +186,39 @@ The default local-development mode is plaintext. A LAN deployment should use:
 - a private CA plus `--client-ca` for agent mutual TLS;
 - an `APC_TOKEN` bearer token for `apc` REST access;
 - a dedicated macOS user and Background LaunchAgent for each APC v2 node;
+- the HA-role LaunchAgent for continuous local proxy and member reconciliation;
 - a LaunchDaemon and dedicated service account for unattended multi-user or
   production-style v1 agents.
 
 Environment variables in this MVP are stored in plaintext. Do not put secrets
 there; a Secret API with encrypted-at-rest values is a follow-up.
+
+## Validated boundaries as of 2026-07-20
+
+- The two-Mac deep doctor with public egress skipped reports 16 passes, two
+  intentional egress warnings and zero failures. Public HTTPS from the MacBook
+  Apple VM remains broken while the Mac mini VM passes.
+- The local HA Helm gate placed three Ready nginx replicas across three native
+  ARM64 K3s/embedded-etcd server VMs. This demonstrates VM-level quorum and
+  scheduling on one Mac, not host-level HA.
+- One intentional member stop remained effective for more than two supervisor
+  ticks. The remaining two voters accepted and returned a Kubernetes write;
+  restarting the stopped member restored 3/3 Ready.
+- A fresh live HA snapshot/restore rolled a changed ConfigMap back, removed a
+  post-snapshot-only object, retained the Helm release, three distributed Pods
+  and PodDisruptionBudget, and completed its recovery journal. The final HA
+  doctor reported 34 passes, three expected egress-skip warnings and zero
+  failures.
+- The validated snapshot package was mode `0700`, with a `0400` manifest and
+  `0600` snapshot/token files. Recovery helpers explicitly request and validate
+  apple/container's exact default network with MTU 1280 instead of assuming an
+  omitted network produces no attachment.
+- Peer-restricted PF install and privileged status pass on both Macs, but the
+  tested path is still trusted-LAN PF rather than an authenticated overlay.
+  Reboot persistence, rejection of an unlisted peer and overlay repetition are
+  not yet proven.
+- Tailscale is absent and unauthenticated. Installation, macOS network approval
+  and account authentication require explicit user action.
+- The manual hardware workflow is default-branch-only and read-only by default,
+  and does not check out repository code on self-hosted Macs. The dedicated
+  runners are not registered, so the GitHub-hosted hardware gate remains open.

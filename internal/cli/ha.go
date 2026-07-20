@@ -22,6 +22,12 @@ type haManager interface {
 	StartHA(context.Context, string, time.Duration) (cluster.HAState, error)
 	StopHA(context.Context, string) error
 	DeleteHA(context.Context, string, bool) error
+	SnapshotHA(context.Context, string, string) (cluster.HASnapshotResult, error)
+	RestoreHA(context.Context, string, string, time.Duration) (cluster.HAState, error)
+	StopHAMember(context.Context, string, int, time.Duration) (cluster.HAState, error)
+	StartHAMember(context.Context, string, int, time.Duration) (cluster.HAState, error)
+	RestartHAMember(context.Context, string, int, time.Duration) (cluster.HAState, error)
+	ServeHAProxy(context.Context, string) error
 }
 
 var newHAManager = func() haManager {
@@ -69,6 +75,10 @@ func (o *options) clusterHACommand() *cobra.Command {
 		o.clusterHAStartCommand(),
 		o.clusterHAStopCommand(),
 		o.clusterHADeleteCommand(),
+		o.clusterHASnapshotCommand(),
+		o.clusterHARestoreCommand(),
+		o.clusterHAMemberCommand(),
+		o.clusterHAProxyCommand(),
 	)
 	return command
 }

@@ -26,7 +26,7 @@ import (
 	"github.com/buberlo/apple-pod-control/internal/overlay"
 )
 
-const Version = "v0.2.0-alpha.1"
+const Version = "v0.2.0-alpha.2"
 
 type options struct {
 	server             string
@@ -64,7 +64,7 @@ func NewCommand(out, errOut io.Writer) *cobra.Command {
 	command.AddCommand(
 		options.applyCommand(), options.getCommand(), options.describeCommand(), options.deleteCommand(),
 		options.rolloutCommand(), options.scaleCommand(), options.versionCommand(), options.doctorCommand(),
-		options.clusterCommand(), options.nodeCommand(), options.imageCommand(), options.systemCommand(), options.configCommand(), options.kubeconfigCommand(), options.kubectlCommand(),
+		options.clusterCommand(), options.nodeCommand(), options.imageCommand(), options.systemCommand(), options.configCommand(), options.kubeconfigCommand(), options.kubectlCommand(), options.helmCommand(),
 	)
 	return command
 }
@@ -311,7 +311,7 @@ func (o *options) systemInstallCommand() *cobra.Command {
 			return nil
 		},
 	}
-	command.Flags().StringVar(&config.Role, "role", "server", "node role: server or agent")
+	command.Flags().StringVar(&config.Role, "role", "server", "node role: server, agent, or ha")
 	command.Flags().StringVar(&config.Executable, "executable", "", "stable APC executable path; defaults to the current binary")
 	command.Flags().DurationVar(&config.Interval, "interval", 15*time.Second, "health reconciliation interval")
 	return command
@@ -341,7 +341,7 @@ func (o *options) systemUninstallCommand() *cobra.Command {
 			return nil
 		},
 	}
-	command.Flags().StringVar(&config.Role, "role", "server", "node role: server or agent")
+	command.Flags().StringVar(&config.Role, "role", "server", "node role: server, agent, or ha")
 	return command
 }
 
@@ -370,7 +370,7 @@ func (o *options) systemStatusCommand() *cobra.Command {
 			return err
 		},
 	}
-	command.Flags().StringVar(&config.Role, "role", "server", "node role: server or agent")
+	command.Flags().StringVar(&config.Role, "role", "server", "node role: server, agent, or ha")
 	return command
 }
 
@@ -386,7 +386,7 @@ func (o *options) systemSuperviseCommand() *cobra.Command {
 			return cluster.NewManager("container").Supervise(command.Context(), config)
 		},
 	}
-	command.Flags().StringVar(&config.Role, "role", "server", "node role: server or agent")
+	command.Flags().StringVar(&config.Role, "role", "server", "node role: server, agent, or ha")
 	command.Flags().DurationVar(&config.Interval, "interval", 15*time.Second, "health reconciliation interval")
 	return command
 }

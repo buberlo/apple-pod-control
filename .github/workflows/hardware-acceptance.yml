@@ -1,0 +1,206 @@
+name: Two-Mac hardware acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster:
+        description: Existing APC cluster name on both trusted Macs
+        required: true
+        default: lan-spike
+        type: string
+      expected_nodes:
+        description: Minimum Ready Kubernetes nodes observed by the MacBook
+        required: true
+        default: "2"
+        type: string
+      allow_live_mutation:
+        description: Explicitly allow requested live-cluster diagnostic mutations
+        required: true
+        default: false
+        type: boolean
+      run_deep_doctor:
+        description: Create temporary probe Pods and Service with apc cluster doctor
+        required: true
+        default: false
+        type: boolean
+      check_public_egress:
+        description: Include public HTTPS in the mutating deep-doctor gate
+        required: true
+        default: false
+        type: boolean
+      doctor_timeout:
+        description: Deep-doctor timeout, for example 5m
+        required: true
+        default: 5m
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apc-two-mac-hardware-acceptance
+  cancel-in-progress: false
+
+jobs:
+  trusted-dispatch:
+    name: Require trusted default-branch dispatch
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Validate immutable gate inputs
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          CLUSTER: ${{ inputs.cluster }}
+          EXPECTED_NODES: ${{ inputs.expected_nodes }}
+          ALLOW_MUTATION: ${{ inputs.allow_live_mutation }}
+          DEEP_DOCTOR: ${{ inputs.run_deep_doctor }}
+          INCLUDE_EGRESS: ${{ inputs.check_public_egress }}
+          DOCTOR_TIMEOUT: ${{ inputs.doctor_timeout }}
+        run: |
+          set -euo pipefail
+          expected_ref="refs/heads/${DEFAULT_BRANCH}"
+          if [[ "$GITHUB_REF" != "$expected_ref" ]]; then
+            echo "Hardware runners accept dispatches only from ${expected_ref}." >&2
+            exit 1
+          fi
+          [[ "$CLUSTER" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ && ${#CLUSTER} -le 63 ]]
+          [[ "$EXPECTED_NODES" =~ ^[1-9][0-9]*$ ]]
+          [[ "$DOCTOR_TIMEOUT" =~ ^[1-9][0-9]*[smh]$ ]]
+          if [[ "$DEEP_DOCTOR" == true && "$ALLOW_MUTATION" != true ]]; then
+            echo "run_deep_doctor requires allow_live_mutation=true." >&2
+            exit 1
+          fi
+          if [[ "$INCLUDE_EGRESS" == true && "$DEEP_DOCTOR" != true ]]; then
+            echo "check_public_egress requires run_deep_doctor=true." >&2
+            exit 1
+          fi
+
+  macmini:
+    name: Mac Mini worker checks
+    needs: trusted-dispatch
+    runs-on: [self-hosted, macOS, ARM64, apc-macmini]
+    timeout-minutes: 15
+    # The harness tries read-only PF verification with sudo -n and never
+    # prompts. Root PF and reboot-persistence proof remains a separate manual
+    # gate when the runner has no pre-existing narrow permission.
+    steps:
+      - name: Run installed-software acceptance harness
+        id: acceptance
+        env:
+          CLUSTER: ${{ inputs.cluster }}
+          EXPECTED_NODES: ${{ inputs.expected_nodes }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_dir="$RUNNER_TEMP/apc-hardware-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-macmini"
+          mkdir -m 700 "$artifact_dir"
+          echo "artifact_dir=$artifact_dir" >>"$GITHUB_OUTPUT"
+          harness=$(mktemp "$RUNNER_TEMP/apc-hardware-harness.XXXXXX")
+          trap 'rm -f "$harness"' EXIT
+          status=0
+          trusted_url="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/hardware-acceptance.sh"
+          if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            "$trusted_url" --output "$harness"; then
+            printf '%s\n' 'Could not download the trusted harness.' >"$artifact_dir/bootstrap-error.log"
+            status=1
+          else
+            chmod 700 "$harness"
+            "$harness" --role agent --cluster "$CLUSTER" --output "$artifact_dir" \
+              --expected-nodes "$EXPECTED_NODES" || status=$?
+          fi
+          if [[ ! -f "$artifact_dir/sanitization.txt" ]]; then
+            for artifact in "$artifact_dir"/*; do
+              [[ -f "$artifact" && ! -L "$artifact" ]] || continue
+              printf '%s\n' 'Raw diagnostic discarded: sanitizer completion marker missing.' >"$artifact"
+            done
+            printf '%s\n' 'status=fallback-discard' >"$artifact_dir/sanitization.txt"
+            status=1
+          fi
+          echo "exit_code=$status" >>"$GITHUB_OUTPUT"
+
+      - name: Upload Mac Mini diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hardware-macmini-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.acceptance.outputs.artifact_dir }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Enforce Mac Mini result
+        if: always()
+        env:
+          EXIT_CODE: ${{ steps.acceptance.outputs.exit_code }}
+        run: |
+          [[ "$EXIT_CODE" =~ ^[0-9]+$ && "$EXIT_CODE" == 0 ]]
+
+  macbook:
+    name: MacBook control-plane checks
+    needs: trusted-dispatch
+    runs-on: [self-hosted, macOS, ARM64, apc-macbook]
+    timeout-minutes: 25
+    # As above, lack of non-interactive root status becomes an artifact WARN;
+    # this workflow never installs sudo policy or accepts a password.
+    steps:
+      - name: Run installed-software acceptance harness
+        id: acceptance
+        env:
+          CLUSTER: ${{ inputs.cluster }}
+          EXPECTED_NODES: ${{ inputs.expected_nodes }}
+          ALLOW_MUTATION: ${{ inputs.allow_live_mutation }}
+          DEEP_DOCTOR: ${{ inputs.run_deep_doctor }}
+          INCLUDE_EGRESS: ${{ inputs.check_public_egress }}
+          DOCTOR_TIMEOUT: ${{ inputs.doctor_timeout }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_dir="$RUNNER_TEMP/apc-hardware-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-macbook"
+          mkdir -m 700 "$artifact_dir"
+          echo "artifact_dir=$artifact_dir" >>"$GITHUB_OUTPUT"
+          harness=$(mktemp "$RUNNER_TEMP/apc-hardware-harness.XXXXXX")
+          trap 'rm -f "$harness"' EXIT
+          arguments=(
+            --role server
+            --cluster "$CLUSTER"
+            --output "$artifact_dir"
+            --expected-nodes "$EXPECTED_NODES"
+            --doctor-timeout "$DOCTOR_TIMEOUT"
+          )
+          if [[ "$ALLOW_MUTATION" == true ]]; then arguments+=(--allow-mutation); fi
+          if [[ "$DEEP_DOCTOR" == true ]]; then arguments+=(--deep-doctor); fi
+          if [[ "$INCLUDE_EGRESS" == true ]]; then arguments+=(--include-egress); fi
+          status=0
+          trusted_url="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/hardware-acceptance.sh"
+          if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            "$trusted_url" --output "$harness"; then
+            printf '%s\n' 'Could not download the trusted harness.' >"$artifact_dir/bootstrap-error.log"
+            status=1
+          else
+            chmod 700 "$harness"
+            "$harness" "${arguments[@]}" || status=$?
+          fi
+          if [[ ! -f "$artifact_dir/sanitization.txt" ]]; then
+            for artifact in "$artifact_dir"/*; do
+              [[ -f "$artifact" && ! -L "$artifact" ]] || continue
+              printf '%s\n' 'Raw diagnostic discarded: sanitizer completion marker missing.' >"$artifact"
+            done
+            printf '%s\n' 'status=fallback-discard' >"$artifact_dir/sanitization.txt"
+            status=1
+          fi
+          echo "exit_code=$status" >>"$GITHUB_OUTPUT"
+
+      - name: Upload MacBook diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hardware-macbook-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.acceptance.outputs.artifact_dir }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Enforce MacBook result
+        if: always()
+        env:
+          EXIT_CODE: ${{ steps.acceptance.outputs.exit_code }}
+        run: |
+          [[ "$EXIT_CODE" =~ ^[0-9]+$ && "$EXIT_CODE" == 0 ]]

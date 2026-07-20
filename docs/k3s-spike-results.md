@@ -1,6 +1,7 @@
 # K3s on Apple container 1.0: two-Mac spike results
 
-Initial run: 2026-07-17. Lifecycle and recovery follow-up: 2026-07-19.
+Initial run: 2026-07-17. Lifecycle and recovery follow-ups: 2026-07-19 and
+2026-07-20.
 
 The spike ran a pinned, native ARM64 K3s server in an Apple container VM on a
 MacBook and a K3s agent in a second Apple container VM on a Mac mini. APC v1
@@ -13,9 +14,9 @@ intentionally omitted.
 |---|---|---|
 | Required preflight on both Apple Silicon Macs | Pass | Darwin/arm64, Apple container 1.0, service, capabilities and required ports |
 | K3s server, SQLite, scheduler, containerd and kubelet | Pass | Server node reached Kubernetes `Ready` |
-| Native `kubectl` and Helm | Pass | Host clients reached the generated kubeconfig; chart install completed |
+| Native `kubectl`, native Helm and `apc helm` | Pass | Host clients reached the protected generated kubeconfig; chart installs completed |
 | kubectl-compatible `apc` frontend | Pass | `get`, server-side dry-run `apply`, `logs`, `exec`, `auth can-i` and `cluster-info` ran against K3s |
-| Deep `apc cluster doctor` | Pass as a diagnostic | Created one Pod per node, found the known network failures, and verified exact-resource cleanup |
+| Deep `apc cluster doctor` | Pass as a diagnostic | The final two-Mac skip-egress gate reported 16 pass, two intentional warnings and zero failures; exact-resource cleanup passed |
 | Host-mediated image sync | Pass | A new ARM64 image was streamed into both K3s stores and ran with `imagePullPolicy: Never` on both Macs |
 | Second physical node | Pass | Mac mini agent joined and reached `Ready` |
 | Scheduler placement across hosts | Pass | Two nginx replicas, one on each physical Mac |
@@ -29,9 +30,18 @@ intentionally omitted.
 | launchd supervision | Pass | Background LaunchAgents ran on both Macs and reconciled server/agent without failures |
 | Stable node identity across private VM address changes | Pass | Replacement VMs bound the saved Kubernetes `InternalIP`; both Nodes remained Ready without an address collision |
 | Kubernetes NetworkPolicy | Pass | Controller survived consecutive server/agent envelope replacements; cross-host default-deny and label-selected TCP allow both passed |
-| Peer-restricted macOS PF rules | Pass in implementation/validation | `pfctl` accepted server and agent rules; root-owned reboot persistence and reversible PF references are implemented |
+| Peer-restricted macOS PF rules | Partial live pass | Install and privileged status passed on both Macs for the root-owned helpers, LaunchDaemons, references and exact-peer anchors; reboot, unlisted-peer rejection and overlay repetition remain open |
 | Full simultaneous restart/reconnect | Pass | Both envelopes were stopped together; LaunchAgents recreated them, retained stable InternalIPs and returned both Nodes to Ready in about 15 seconds |
 | WireGuard-native Flannel | Unsupported | Apple container 1.0 guest kernel returned `operation not supported` |
+| Local three-server embedded-etcd HA | Pass at VM level | Three Ready K3s/etcd server VMs formed quorum on one Mac and tolerated one member being offline; this is one physical fault domain |
+| Stable HA client API | Pass | The HA LaunchAgent serves a loopback TLS-pass-through endpoint on the default port 17442 with authenticated direct-member fallback |
+| HA Helm topology spread | Pass | A live Helm release placed three Ready replicas, one on each of the three HA VMs |
+| HA image prefetch | Pass in implementation/tests | Exact topology is resolved before mutation and one ARM64 archive is imported and verified on all three running members |
+| HA deep doctor | Live pass | Final gate: 34 passes, three expected public-egress-skip warnings and zero failures |
+| HA in-place rollback | Live pass | Fresh restore returned 3/3 Ready, reverted changed data, removed a post-snapshot-only object and preserved the Helm release/three Pods/PDB |
+| HA member lifecycle and serialization | Live pass | One intentional stop survived more than two supervisor ticks; the two-voter quorum accepted a write and member start restored 3/3 |
+| Manual two-Mac hardware workflow | Pending runners | Default-branch-only, read-only-by-default workflow exists; dedicated self-hosted runners are not registered |
+| Authenticated host overlay | Pending user action | Tailscale is absent on both Macs and requires installation, macOS approval and interactive user authentication |
 
 ## Runtime findings reflected in the implementation
 
@@ -41,6 +51,18 @@ intentionally omitted.
 - Apple VM private addresses are treated as ephemeral. The K3s entrypoint
   discovers the current address on every boot instead of trusting a previous
   DHCP lease or deterministic MAC.
+- Apple container 1.0 assigns the dynamic primary IPv4 independently of a MAC
+  requested on `container run`; it cannot reserve a fixed primary address. HA
+  startup and restore therefore guard against allocation of another member's
+  stable address before K3s or etcd mutation.
+- A colliding exact APC-owned envelope is stopped, deleted and retried only
+  under fixed attempt and time bounds. The preceding known envelope format is
+  migrated one Ready member at a time. Foreign or identity-mismatched
+  containers are never adopted or removed by this path.
+- apple/container automatically attaches its default network when a generic
+  recovery helper omits `--network`. APC therefore requests
+  `default,mtu=1280` explicitly and accepts such a helper only when it has that
+  exact single network identity; the corrected live snapshot/restore passed.
 - `/var/lib/rancher/k3s` is stored on an APC-labelled 8 GiB Apple volume. Start
   recreates the lightweight VM envelope and reattaches the volume.
 - APC retains each node's Kubernetes `InternalIP` as a secondary address when
@@ -55,15 +77,23 @@ intentionally omitted.
 
 ## Remaining gates for a usable alpha
 
-1. Add the simultaneous supervisor recovery gate to dedicated two-Mac hardware
-   CI; the manual real-hardware repetition now passes.
-2. Perform the explicit administrator-authorized PF LaunchDaemon installation
-   on both Macs. Rule rendering and parser validation are already complete.
-3. Install and authenticate the selected host overlay on both Macs, then run
-   APC's implemented identity/peer/route preflight and repeat the network gates;
-   do not expose unencrypted VXLAN directly to an untrusted network.
-4. Add three-server embedded-etcd HA. A two-node server/agent cluster is not
-   control-plane HA and cannot prove a three-fault-domain design.
+1. Register dedicated `apc-macbook` and `apc-macmini` self-hosted runners and
+   dispatch the manual hardware workflow from the default branch. It must never
+   run untrusted pull-request code on those hosts.
+2. Reboot both Macs and verify that the root LaunchDaemons reconstruct the exact
+   PF anchors and references. Then prove that a listed peer succeeds and an
+   unlisted peer is rejected.
+3. Have the user install and authenticate Tailscale on both Macs, approve the
+   macOS network configuration, run APC's identity/peer/route preflight and
+   repeat the network gates over the authenticated overlay.
+4. Move control-plane members to three independent physical failure domains
+   before making host-level HA claims. Three etcd VMs on one Mac prove quorum
+   behavior, not physical-host availability.
+5. Resolve or explicitly accept the MacBook Apple VM's public HTTPS egress
+   failure. Host-mediated image distribution is a mitigation, not a NAT fix.
+6. Design and prove replacement-host and token-loss recovery. The current HA
+   restore requires the original saved configuration, exact network, all three
+   member volumes and the current token file matching the packaged token.
 
 The kubectl-compatible APC frontend is now implemented. Additional Kubernetes
 verbs inherit their behavior from the installed native `kubectl`; APC does not
@@ -164,3 +194,73 @@ again. Supervisor logs remained empty.
 The example Helm release was upgraded in place to include NetworkPolicy,
 rolling-update strategy, seccomp defaults and a PodDisruptionBudget. A live
 same-namespace BusyBox client retrieved the nginx page through the ClusterIP.
+
+## HA, PF and hardware-workflow follow-up on 2026-07-20
+
+The local `ha-lab` consists of three native ARM64 K3s server VMs with embedded
+etcd, three named member volumes and one APC-owned private network. All three
+Node/API pairs reached Ready. A Helm deployment with three replicas and strict
+topology spread placed one Ready nginx Pod on each VM; its PodDisruptionBudget
+reported one allowed disruption. This is live evidence for Kubernetes
+scheduling across three Apple VMs, but all three still share one Mac.
+
+The HA supervisor now reconciles the member set and serves a deterministic
+loopback TLS-pass-through endpoint. With the default member API ports its
+address is `https://127.0.0.1:17442`. APC authenticates the proxy with the
+existing Kubernetes client credentials before writing it into kubeconfig. If
+the proxy is unavailable, kubeconfig preparation selects a reachable Ready
+member directly. Native kubectl, `apc helm` and direct Helm therefore share the
+same protected endpoint-selection path.
+
+Dedicated HA operations now include:
+
+- preflighted image import into all three running member containerd stores;
+- per-member runtime, API, Node and quorum checks in the deep doctor;
+- quorum-safe member stop, start and restart with best-effort recovery;
+- native K3s etcd snapshot export with the matching server token;
+- checksum-, identity- and topology-validated three-member restore;
+- a private cross-process lock around snapshot, restore and member lifecycle.
+
+The final live sequence first stopped one member intentionally. It remained
+stopped for more than two supervisor ticks, while the other two embedded-etcd
+voters accepted a ConfigMap write and returned it through the Kubernetes API.
+Starting the member again restored 3/3 Ready.
+
+A fresh snapshot was then taken, after which one ConfigMap was changed and a
+second object was created. Restore returned the first object to its
+before-snapshot value and removed the post-snapshot-only object. All three
+member runtime/API/Node pairs returned Ready; the existing Helm nginx release
+still had three topology-spread Ready Pods and its PodDisruptionBudget. The
+protected recovery journal recorded `completed` and recovery success. The HA
+LaunchAgent's TLS-pass-through proxy remained available at
+`https://127.0.0.1:17442` after recovery. The published package was mode `0700`,
+with a `0400` manifest and `0600` snapshot/token artifacts.
+
+The final HA deep doctor reported 34 passes, three expected warnings for
+intentionally skipped public HTTPS egress and zero failures.
+
+The HA restore is intentionally limited to rollback on the same saved cluster.
+It requires the protected saved configuration, current matching token, exact
+network and all three original member volumes. It is not a package that can
+bootstrap a replacement Mac, and it is not recovery from loss of all volumes.
+The packaged token must be encrypted and protected as a credential; without
+the matching current on-host token file, this restore refuses to proceed.
+Replacement-host and token-loss DR therefore remain open.
+
+Persistent PF install and privileged status now pass on both physical Macs over
+the trusted LAN. The running-state verification covered the root-owned helper,
+LaunchDaemon, PF reference and complete anchor. Neither a host reboot, a
+connection from an unlisted peer nor the authenticated-overlay repetition has
+been tested, so those remain open gates.
+
+The manual two-Mac workflow now contains default-branch and no-checkout guards,
+read-only/status checks by default, explicit opt-in for the mutating deep
+doctor, and redacted artifacts. The matching local read-only harness passed;
+the GitHub workflow has not run because neither dedicated self-hosted runner is
+registered. Tailscale is also absent on both hosts and cannot be completed
+without user installation, macOS approval and interactive authentication.
+
+The current two-Mac network baseline remains 16 passes, two intentionally
+skipped public-egress warnings and zero failures with `--skip-egress`. Without
+that flag, public HTTPS from the MacBook Apple VM fails while the Mac mini VM
+passes; cross-host VXLAN, DNS and ClusterIP routing remain healthy.
