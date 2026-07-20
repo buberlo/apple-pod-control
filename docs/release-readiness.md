@@ -52,8 +52,8 @@ the hardware- and account-dependent alpha gates.
 
 | Gate | State on 2026-07-20 | Evidence | Owner / dependency category | Objective completion condition |
 |---|---|---|---|---|
-| M1. Required CI | **Open** | The previous published head passed; the final K3s-only head must be published and rerun | APC engineering / repository automation | Every required check for the final head commit completes successfully |
-| M2. Merge conflict state | **Open** | The final head has not yet been evaluated against the then-current `main` | APC engineering / Git history | GitHub reports the final head mergeable into the current base branch |
+| M1. Required CI | **Pass** | The published K3s-only PR head passed plain tests, the race suite, vet, build, module-tidiness, shell fixtures and Helm validation on GitHub Actions | APC engineering / repository automation | Every required check for the final head commit completes successfully |
+| M2. Merge conflict state | **Pass** | GitHub reports the draft PR cleanly mergeable into the current `main` | APC engineering / Git history | GitHub reports the final head mergeable into the current base branch |
 | M3. Independent review | **Open** | GitHub reports no submitted review | Maintainer / human review | At least one authorized reviewer approves the final diff and no blocking review remains |
 | M4. Publication state | **Open** | PR #5 is still a draft | Maintainer / repository action | The PR is converted from draft only after M1-M3 pass and its description states the alpha limitations below |
 | M5. Claim accuracy | **Partial** | The validation report and operator docs now scope the Mac mini PF/runner reboot proofs separately from the unproved MacBook and APC-service gates | APC engineering / documentation | Diff review finds no generalized claim of reboot persistence, overlay encryption, public egress, physical HA or replacement-host recovery beyond its direct evidence |
