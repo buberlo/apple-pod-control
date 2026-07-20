@@ -30,6 +30,36 @@ func TestKubernetesPassthroughUsesExplicitClusterAndPreservesKubectlArguments(t 
 	}
 }
 
+func TestKubernetesPassthroughAcceptsClusterFlagAfterVerb(t *testing.T) {
+	env, captured := passthroughTestEnvironment(t)
+	handled, err := tryKubernetesPassthrough(
+		context.Background(),
+		[]string{"get", "pods", "--cluster", "ha-lab", "-o", "wide"},
+		nil, io.Discard, io.Discard, env,
+	)
+	if err != nil || !handled {
+		t.Fatalf("handled = %t, err = %v", handled, err)
+	}
+	if captured.cluster != "ha-lab" || !reflect.DeepEqual(captured.arguments, []string{"get", "pods", "-o", "wide"}) {
+		t.Fatalf("cluster = %q, arguments = %#v", captured.cluster, captured.arguments)
+	}
+}
+
+func TestKubernetesPassthroughPreservesClusterTextAfterDoubleDash(t *testing.T) {
+	env, captured := passthroughTestEnvironment(t)
+	handled, err := tryKubernetesPassthrough(
+		context.Background(),
+		[]string{"exec", "pod/web", "--", "echo", "--cluster", "literal"},
+		nil, io.Discard, io.Discard, env,
+	)
+	if err != nil || !handled {
+		t.Fatalf("handled = %t, err = %v", handled, err)
+	}
+	if captured.cluster != "current" || !reflect.DeepEqual(captured.arguments, []string{"exec", "pod/web", "--", "echo", "--cluster", "literal"}) {
+		t.Fatalf("cluster = %q, arguments = %#v", captured.cluster, captured.arguments)
+	}
+}
+
 func TestKubernetesPassthroughUsesCurrentCluster(t *testing.T) {
 	env, captured := passthroughTestEnvironment(t)
 	handled, err := tryKubernetesPassthrough(context.Background(), []string{"apply", "-f", "deployment.yaml"}, nil, io.Discard, io.Discard, env)
@@ -38,6 +68,22 @@ func TestKubernetesPassthroughUsesCurrentCluster(t *testing.T) {
 	}
 	if captured.cluster != "current" {
 		t.Fatalf("cluster = %q", captured.cluster)
+	}
+}
+
+func TestKubernetesPassthroughPreparesHAEndpointBeforeKubectl(t *testing.T) {
+	env, captured := passthroughTestEnvironment(t)
+	prepared := false
+	env.prepareKubeconfig = func(_ context.Context, name string) (string, error) {
+		prepared = true
+		return env.kubeconfigPath(name)
+	}
+	handled, err := tryKubernetesPassthrough(context.Background(), []string{"--cluster", "ha-lab", "get", "pods"}, nil, io.Discard, io.Discard, env)
+	if err != nil || !handled {
+		t.Fatalf("handled = %t, err = %v", handled, err)
+	}
+	if !prepared || captured.cluster != "ha-lab" {
+		t.Fatalf("prepare called = %t, cluster = %q", prepared, captured.cluster)
 	}
 }
 

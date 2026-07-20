@@ -13,6 +13,10 @@ recorded in [ADR 0001](docs/adr/0001-k3s-control-plane.md), and the isolated
 The [two-Mac validation report](docs/k3s-spike-results.md) records what passed
 and the Apple runtime networking issue found during restart testing.
 
+APC can also run a local three-server K3s/embedded-etcd lab in three native
+ARM64 Apple micro-VMs. It tolerates one server-VM failure while remaining one
+physical Mac failure domain. See the [local K3s HA guide](docs/k3s-ha.md).
+
 This repository is an MVP: it is useful for development and trusted LAN labs,
 but it is not a production replacement for Kubernetes. The architecture and
 failure behavior are documented in [docs/architecture.md](docs/architecture.md).
@@ -56,6 +60,9 @@ apc image sync docker.io/library/busybox:1.36.1 --peer user@mac-mini.local
 apc cluster backup lan-spike --output "$HOME/Backups/lan-spike.apcbackup"
 apc system install --role server --cluster lan-spike
 apc cluster network-policy enable lan-spike --yes
+apc cluster ha create ha-lab
+apc cluster ha status ha-lab
+apc --cluster ha-lab get nodes -o wide
 ```
 
 APC owns cluster lifecycle and context selection. Kubernetes continues to own

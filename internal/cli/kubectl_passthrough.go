@@ -26,12 +26,13 @@ var leadingFlagsWithValues = map[string]struct{}{
 }
 
 type passthroughEnvironment struct {
-	getenv         func(string) string
-	lookPath       func(string) (string, error)
-	currentCluster func() (string, error)
-	kubeconfigPath func(string) (string, error)
-	stat           func(string) (os.FileInfo, error)
-	run            func(context.Context, string, []string, string, io.Reader, io.Writer, io.Writer) error
+	getenv            func(string) string
+	lookPath          func(string) (string, error)
+	currentCluster    func() (string, error)
+	kubeconfigPath    func(string) (string, error)
+	prepareKubeconfig func(context.Context, string) (string, error)
+	stat              func(string) (os.FileInfo, error)
+	run               func(context.Context, string, []string, string, io.Reader, io.Writer, io.Writer) error
 }
 
 // TryKubernetesPassthrough executes kubectl-compatible APC commands against the
@@ -42,12 +43,14 @@ func TryKubernetesPassthrough(ctx context.Context, arguments []string, stdin io.
 }
 
 func defaultPassthroughEnvironment() passthroughEnvironment {
+	manager := cluster.NewManager("container")
 	return passthroughEnvironment{
-		getenv:         os.Getenv,
-		lookPath:       exec.LookPath,
-		currentCluster: cluster.CurrentCluster,
-		kubeconfigPath: cluster.ResolvedKubeconfigPath,
-		stat:           os.Stat,
+		getenv:            os.Getenv,
+		lookPath:          exec.LookPath,
+		currentCluster:    cluster.CurrentCluster,
+		kubeconfigPath:    cluster.ResolvedKubeconfigPath,
+		prepareKubeconfig: manager.PrepareKubeconfig,
+		stat:              os.Stat,
 		run: func(ctx context.Context, binary string, arguments []string, kubeconfig string, stdin io.Reader, stdout, stderr io.Writer) error {
 			command := exec.CommandContext(ctx, binary, arguments...)
 			command.Stdin = stdin
@@ -88,7 +91,12 @@ func tryKubernetesPassthrough(ctx context.Context, arguments []string, stdin io.
 		}
 	}
 
-	kubeconfig, err := env.kubeconfigPath(clusterName)
+	var kubeconfig string
+	if env.prepareKubeconfig != nil {
+		kubeconfig, err = env.prepareKubeconfig(ctx, clusterName)
+	} else {
+		kubeconfig, err = env.kubeconfigPath(clusterName)
+	}
 	if err != nil {
 		return true, fmt.Errorf("resolve kubeconfig for cluster %q: %w", clusterName, err)
 	}
@@ -114,27 +122,37 @@ func tryKubernetesPassthrough(ctx context.Context, arguments []string, stdin io.
 
 func routeKubernetesArguments(arguments []string) (forwarded []string, clusterName string, kubernetesCommand, legacy bool, err error) {
 	forwarded = make([]string, 0, len(arguments))
+	literalArguments := false
 	for index := 0; index < len(arguments); index++ {
 		argument := arguments[index]
+		if literalArguments {
+			forwarded = append(forwarded, argument)
+			continue
+		}
+		if kubernetesCommand && argument == "--" {
+			literalArguments = true
+			forwarded = append(forwarded, argument)
+			continue
+		}
 		if argument == "--legacy" {
 			return arguments, "", false, true, nil
 		}
-		if !kubernetesCommand {
-			switch {
-			case argument == "--cluster":
-				if index+1 >= len(arguments) || strings.HasPrefix(arguments[index+1], "-") {
-					return nil, "", false, false, fmt.Errorf("--cluster requires a name")
-				}
-				clusterName = arguments[index+1]
-				index++
-				continue
-			case strings.HasPrefix(argument, "--cluster="):
-				clusterName = strings.TrimPrefix(argument, "--cluster=")
-				if clusterName == "" {
-					return nil, "", false, false, fmt.Errorf("--cluster requires a name")
-				}
-				continue
+		switch {
+		case argument == "--cluster":
+			if index+1 >= len(arguments) || strings.HasPrefix(arguments[index+1], "-") {
+				return nil, "", false, false, fmt.Errorf("--cluster requires a name")
 			}
+			clusterName = arguments[index+1]
+			index++
+			continue
+		case strings.HasPrefix(argument, "--cluster="):
+			clusterName = strings.TrimPrefix(argument, "--cluster=")
+			if clusterName == "" {
+				return nil, "", false, false, fmt.Errorf("--cluster requires a name")
+			}
+			continue
+		}
+		if !kubernetesCommand {
 			if _, takesValue := leadingFlagsWithValues[argument]; takesValue {
 				forwarded = append(forwarded, argument)
 				if index+1 < len(arguments) {

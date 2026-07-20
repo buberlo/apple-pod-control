@@ -489,7 +489,7 @@ func (o *options) doctorCommand() *cobra.Command {
 func (o *options) clusterCommand() *cobra.Command {
 	command := &cobra.Command{Use: "cluster", Short: "Manage Kubernetes clusters hosted by apple/container"}
 	command.AddCommand(
-		o.clusterCreateCommand(), o.clusterStatusCommand(), o.clusterDoctorCommand(), o.clusterStartCommand(), o.clusterStopCommand(), o.clusterDeleteCommand(), o.clusterBackupCommand(), o.clusterRestoreCommand(), o.clusterUpgradeCommand(), o.clusterNetworkPolicyCommand(), o.clusterWriteJoinTokenCommand(),
+		o.clusterCreateCommand(), o.clusterStatusCommand(), o.clusterDoctorCommand(), o.clusterStartCommand(), o.clusterStopCommand(), o.clusterDeleteCommand(), o.clusterBackupCommand(), o.clusterRestoreCommand(), o.clusterUpgradeCommand(), o.clusterNetworkPolicyCommand(), o.clusterWriteJoinTokenCommand(), o.clusterHACommand(),
 	)
 	return command
 }
@@ -918,8 +918,8 @@ func (o *options) kubeconfigCommand() *cobra.Command {
 		Use:   "path [CLUSTER]",
 		Short: "Print the kubeconfig path",
 		Args:  cobra.MaximumNArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
-			path, err := cluster.ResolvedKubeconfigPath(o.clusterName(args))
+		RunE: func(command *cobra.Command, args []string) error {
+			path, err := cluster.NewManager("container").PrepareKubeconfig(command.Context(), o.clusterName(args))
 			if err != nil {
 				return err
 			}
