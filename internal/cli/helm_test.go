@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/buberlo/apple-pod-control/internal/cluster"
 )
 
 func TestHelmCommandUsesSelectedProtectedKubeconfigAndForwardsArguments(t *testing.T) {
@@ -22,6 +24,8 @@ func TestHelmCommandUsesSelectedProtectedKubeconfigAndForwardsArguments(t *testi
 	previous := newHelmEnvironment
 	newHelmEnvironment = func() helmEnvironment {
 		return helmEnvironment{
+			getenv:         func(string) string { return "" },
+			currentCluster: func() (string, error) { return "", errors.New("unexpected current-cluster lookup") },
 			lookPath: func(name string) (string, error) {
 				if name != "helm" {
 					t.Fatalf("lookPath(%q)", name)
@@ -66,6 +70,8 @@ func TestHelmCommandRejectsReadableKubeconfigBeforeLookupOrRun(t *testing.T) {
 	previous := newHelmEnvironment
 	newHelmEnvironment = func() helmEnvironment {
 		return helmEnvironment{
+			getenv:            func(string) string { return "" },
+			currentCluster:    func() (string, error) { return "", errors.New("unexpected current-cluster lookup") },
 			prepareKubeconfig: func(context.Context, string) (string, error) { return kubeconfig, nil },
 			stat:              os.Stat,
 			lookPath:          func(string) (string, error) { t.Fatal("lookPath called"); return "", errors.New("unexpected") },
@@ -86,15 +92,56 @@ func TestHelmCommandRejectsReadableKubeconfigBeforeLookupOrRun(t *testing.T) {
 }
 
 func TestKubernetesRouterReservesHelmForCobra(t *testing.T) {
-	_, _, kubernetesCommand, legacy, err := routeKubernetesArguments([]string{"helm", "list"})
-	if err != nil || kubernetesCommand || legacy {
-		t.Fatalf("route helm: kubernetes=%t legacy=%t err=%v", kubernetesCommand, legacy, err)
+	_, _, kubernetesCommand, err := routeKubernetesArguments([]string{"helm", "list"})
+	if err != nil || kubernetesCommand {
+		t.Fatalf("route helm: kubernetes=%t err=%v", kubernetesCommand, err)
 	}
 }
 
 func TestHelmSelectedClusterAcceptsSelectorAfterSubcommand(t *testing.T) {
-	name, arguments := helmSelectedCluster("current", []string{"list", "--cluster", "ha-lab", "--all-namespaces"})
+	name, arguments, err := helmSelectedCluster("current", []string{"list", "--cluster", "ha-lab", "--all-namespaces"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if name != "ha-lab" || !reflect.DeepEqual(arguments, []string{"list", "--all-namespaces"}) {
+		t.Fatalf("selection = %q, arguments = %#v", name, arguments)
+	}
+}
+
+func TestHelmCommandRequiresSelectedCluster(t *testing.T) {
+	previous := newHelmEnvironment
+	newHelmEnvironment = func() helmEnvironment {
+		return helmEnvironment{
+			getenv:         func(string) string { return "" },
+			currentCluster: func() (string, error) { return "", cluster.ErrNoCurrentCluster },
+			prepareKubeconfig: func(context.Context, string) (string, error) {
+				t.Fatal("prepareKubeconfig called without a selected cluster")
+				return "", nil
+			},
+		}
+	}
+	t.Cleanup(func() { newHelmEnvironment = previous })
+
+	command := NewCommand(&bytes.Buffer{}, &bytes.Buffer{})
+	command.SetArgs([]string{"helm", "list"})
+	err := command.Execute()
+	if !errors.Is(err, errNoSelectedCluster) {
+		t.Fatalf("error = %v, want no-selected-cluster guidance", err)
+	}
+}
+
+func TestHelmSelectedClusterRejectsMissingNameAndPreservesLiteralArguments(t *testing.T) {
+	for _, arguments := range [][]string{{"list", "--cluster"}, {"list", "--cluster="}} {
+		if _, _, err := helmSelectedCluster("", arguments); err == nil {
+			t.Fatalf("arguments = %#v, want missing-name error", arguments)
+		}
+	}
+
+	name, arguments, err := helmSelectedCluster("current", []string{"plugin", "--", "--cluster", "literal"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "current" || !reflect.DeepEqual(arguments, []string{"plugin", "--", "--cluster", "literal"}) {
 		t.Fatalf("selection = %q, arguments = %#v", name, arguments)
 	}
 }

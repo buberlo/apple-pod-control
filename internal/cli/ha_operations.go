@@ -23,7 +23,8 @@ func (o *options) clusterHASnapshotCommand() *cobra.Command {
 			}
 			switch outputFormat {
 			case "", "wide":
-				fmt.Fprintf(o.out, "snapshot.apc.dev created: %s (%d bytes, sha256:%s)\n", result.Path, result.Bytes, result.DataSHA256)
+				fmt.Fprintf(o.out, "snapshot.apc.dev created: %s (%d bytes, data-sha256:%s, manifest-sha256:%s)\n", result.Path, result.Bytes, result.DataSHA256, result.ManifestSHA256)
+				fmt.Fprintln(o.errOut, "warning: retain the manifest SHA-256 separately from the snapshot package; empty-host recovery requires both")
 				if result.Warning != "" {
 					fmt.Fprintf(o.errOut, "warning: %s\n", result.Warning)
 				}
@@ -38,6 +39,36 @@ func (o *options) clusterHASnapshotCommand() *cobra.Command {
 	command.Flags().StringVar(&output, "output", "", "new private destination directory for snapshot, manifest, and server token")
 	command.Flags().StringVarP(&outputFormat, "format", "o", "wide", "output format: wide, json, or yaml")
 	_ = command.MarkFlagRequired("output")
+	return command
+}
+
+func (o *options) clusterHARecoverCommand() *cobra.Command {
+	var input, expectedManifestSHA256 string
+	var confirmed bool
+	var timeout time.Duration
+	command := &cobra.Command{
+		Use:   "recover [NAME]",
+		Short: "Reconstruct an exact empty-host HA cluster from a trusted snapshot",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(command *cobra.Command, args []string) error {
+			if !confirmed {
+				return fmt.Errorf("refusing destructive empty-host HA recovery without --yes")
+			}
+			name := o.clusterName(args)
+			state, err := newHAManager().RecoverHA(command.Context(), name, input, expectedManifestSHA256, timeout)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(o.out, "cluster.apc.dev/%s recovered and ready (%d/%d servers)\n", state.Name, state.ReadyMembers, haMemberCount)
+			return nil
+		},
+	}
+	command.Flags().StringVar(&input, "from", "", "protected snapshot package directory")
+	command.Flags().StringVar(&expectedManifestSHA256, "expected-manifest-sha256", "", "independently retained SHA-256 of manifest.json")
+	command.Flags().BoolVar(&confirmed, "yes", false, "confirm exact same-topology reconstruction and embedded-etcd recovery")
+	command.Flags().DurationVar(&timeout, "wait", 5*time.Minute, "maximum time to prepare, restore, and rejoin all three servers")
+	_ = command.MarkFlagRequired("from")
+	_ = command.MarkFlagRequired("expected-manifest-sha256")
 	return command
 }
 

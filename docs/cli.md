@@ -1,16 +1,19 @@
-# APC v2 CLI contract
+# APC CLI contract
 
-APC v2 separates Apple host lifecycle from Kubernetes workload semantics.
+APC separates Apple host lifecycle from Kubernetes workload semantics.
 Cluster and node commands are implemented by APC; workload commands are
 streamed through the installed native `kubectl` using an APC-managed
 kubeconfig.
+
+The project installs one executable, `apc`. K3s remains the API server,
+controller manager, scheduler and desired-state store; APC does not translate
+Kubernetes objects or maintain a parallel workload database.
 
 ```text
 apc cluster/node/doctor/config  -> APC -> apple/container
 apc get/apply/logs/exec/...     -> native kubectl -> K3s API
 apc helm ...                    -> native Helm + selected kubeconfig -> K3s API
 helm                            -> native Helm + exported kubeconfig -> K3s API
-apc --legacy get/apply/...      -> APC v1 REST API
 ```
 
 ## Select a cluster
@@ -33,6 +36,8 @@ Selection precedence is:
 
 The current-cluster file contains only a DNS-label name. Kubeconfigs remain
 mode `0600` and are rejected by the passthrough when group- or world-readable.
+Without an explicit or current cluster, a Kubernetes command fails with context
+selection guidance; APC does not guess an API endpoint.
 
 ## Kubernetes commands
 
@@ -73,7 +78,7 @@ helm list --all-namespaces
 ```
 
 `apc kubectl CLUSTER -- ...` remains available as a non-interactive bootstrap
-fallback when native kubectl has not yet been installed. Direct v2 workload
+fallback when native kubectl has not yet been installed. Direct workload
 commands intentionally require native kubectl.
 
 ## Deep cluster diagnostics
@@ -125,7 +130,7 @@ apc image sync docker.io/library/busybox:1.36.1 \
 APC pulls the requested `linux/arm64` image into Apple's host image store,
 exports one private OCI archive, imports and verifies exact references in the
 local nested K3s containerd, then streams the same archive over key-only SSH to
-each peer's APC agent container. The archive is staged in a private temporary
+each peer's K3s agent VM. The archive is staged in a private temporary
 directory and removed on both success and failure; it is never written to the
 remote Mac. `--pull=false` reuses the host cache.
 
@@ -137,6 +142,20 @@ When the selected cluster has a protected HA configuration, prefetch resolves
 all targets before pulling or exporting. It requires the exact APC-owned
 network, three volumes and three running member envelopes, then imports and
 verifies the image in all three K3s containerd stores from one host archive.
+
+Empty-host recovery creates fresh member stores, so the usual volume
+persistence cannot supply an air-gapped bootstrap. The host image store must
+already contain the exact references used by the pinned K3s build for pause
+3.6, CoreDNS 1.14.4, local-path-provisioner 0.0.36 and metrics-server 0.8.1,
+plus every workload image. After recovery has created the fresh volumes and
+member envelopes, import the complete set without a registry pull before
+expecting bootstrap and workloads to become Ready:
+
+```bash
+apc --cluster ha-lab image prefetch --pull=false \
+  EXACT_PAUSE_IMAGE EXACT_COREDNS_IMAGE EXACT_LOCAL_PATH_IMAGE \
+  EXACT_METRICS_SERVER_IMAGE EXACT_WORKLOAD_IMAGE
+```
 
 ## Lifecycle, backup and upgrades
 
@@ -159,7 +178,7 @@ deleting any Apple container or volume. Full deletion and restore require
 for `start` to recover a missing VM envelope.
 
 Backups are private `0700` directories containing `volume.tar` and a manifest.
-The server is stopped during the stream for a consistent SQLite and filesystem
+The server is stopped during the stream for a consistent K3s data-volume
 snapshot, then returned to its previous running state. Restore verifies the
 manifest, SHA-256 checksum, cluster identity and tar paths before stopping the
 server. Upgrades require immutable OCI digests, always make a backup and use it
@@ -180,6 +199,43 @@ apc system install --role agent --cluster lan-spike \
 The generated user LaunchAgent is restricted to launchd's Background session
 and invokes a long-running APC reconcile loop. It starts Apple's container
 service if needed and recreates a missing/stopped APC envelope from saved state.
+It can be managed over headless SSH once the user's launchd domain exists, but
+it is not an unattended boot service: a live Mac mini reboot showed that macOS
+does not automatically load these per-user plists before login. Use a
+root-managed LaunchDaemon/service account for that production requirement.
+
+For that unattended profile, first remove the matching per-user supervisor and
+then install the system service for an explicit non-root account. Use the same
+stable executable, role, cluster, interval and account for every lifecycle
+command because status verifies the complete service definition:
+
+```bash
+apc_binary=/Users/APC_ACCOUNT/.local/bin/apc
+
+sudo "$apc_binary" system install --role agent --cluster lan-spike \
+  --executable "$apc_binary" --unattended --user APC_ACCOUNT --yes
+
+"$apc_binary" system status --role agent --cluster lan-spike \
+  --executable "$apc_binary" --unattended --user APC_ACCOUNT
+
+sudo "$apc_binary" system uninstall --role agent --cluster lan-spike \
+  --executable "$apc_binary" --unattended --user APC_ACCOUNT --yes
+```
+
+The exact root LaunchDaemon sends its own stdout/stderr to `/dev/null` and
+enters the target bootstrap namespace with `launchctl asuser`. It then drops to
+the selected account through non-interactive `sudo -n -H -u` and starts APC
+under `env -i` with only the exact `HOME` and bounded `PATH`. APC opens its
+1-MiB bounded log only after that privilege drop, beneath the target account's
+protected `~/Library/Logs/APC` directory. Status fails unless the system job is
+`running` with a positive PID and the exact wrapper program and argument vector.
+The root-owned plist and its real root-owned ancestor chain reject writable
+paths and extended allow ACLs.
+
+This unattended design and its deterministic tests are complete, but the live
+APC zero-login reboot repeat is still pending. The Mac mini's runner and PF
+LaunchDaemon reboot proofs are separate and do not establish this APC service
+gate.
 
 ## Local three-server HA operations
 
@@ -228,50 +284,88 @@ health and metrics and verifies unique voting IDs, leader presence, non-learner
 state and exact two-peer membership. A divergent, unhealthy or incomplete
 topology fails before the VM mutation.
 
-Create and restore the dedicated HA package rather than using the legacy
+Create, restore or recover from the dedicated HA package rather than using the
 single-server backup format:
 
 ```bash
 umask 077
 snapshot="$HOME/Backups/ha-lab-2026-07-20"
 apc cluster ha snapshot ha-lab --output "$snapshot"
+# Copy the printed manifest-sha256 to separately protected storage.
+manifest_sha256=MANIFEST_SHA256
+
+# In-place rollback while the saved local cluster still exists:
 apc cluster ha restore ha-lab --from "$snapshot" --yes --wait 5m
+
+# Alternatively, exact reconstruction after deliberately clearing local state:
+apc cluster ha recover ha-lab --from "$snapshot" \
+  --expected-manifest-sha256 "$manifest_sha256" --yes --wait 5m
 ```
 
 The package contains a native K3s etcd snapshot, immutable manifest and the
 matching server token. The token is a credential and part of the recovery
 identity: encrypt off-host copies and never print, email or commit it. Snapshot
 requires 3/3 Ready members plus the same exact embedded-etcd topology proof used
-for quorum-sensitive maintenance. Restore validates checksums, topology, image,
-cluster identity and the current matching token before mutation, then resets
-member 1 and rejoins members 2 and 3. Its private journal is also a supervisor
-interlock: nonterminal, unsuccessful or untrusted recovery state blocks
-automatic VM changes until restore is safely completed or retried. A terminal
-failed restore is considered runtime-safe only when its recorded automatic
-recovery succeeded.
+for quorum-sensitive maintenance. The printed manifest SHA-256 must be retained
+separately: the manifest inside the same package is not an independent trust
+anchor.
 
-Restore is only an in-place rollback of the same saved cluster. It requires the
+Restore validates checksums, topology, image, cluster identity and the current
+matching token before mutation, then resets member 1 and rejoins members 2 and
+3. It is only an in-place rollback of the same saved cluster and requires the
 saved configuration, exact current network, all three exact member volumes and
-the current token file matching the packaged token. It cannot bootstrap a
-replacement Mac or recover three lost volumes. Snapshot, restore and member
-lifecycle commands share a private per-cluster cross-process lock so separate
-APC processes cannot overlap quorum-sensitive operations.
+the current token file matching the packaged token.
+
+Recover has the complementary empty-host contract. It requires the package and
+the independently retained digest, then reconstructs the exact saved
+configuration, token, network and three-volume topology before running the same
+embedded-etcd recovery sequence. A digest mismatch is checked before any local
+state is published: the live negative gate caused exactly zero configuration,
+token, network, volume or VM mutation.
+
+The private recovery journal is a supervisor interlock: nonterminal,
+unsuccessful or untrusted recovery state blocks automatic VM changes until the
+operation is safely completed or retried. A terminal failed restore is
+considered runtime-safe only when its recorded automatic recovery succeeded. A
+failed empty-host recovery that created new volumes must be retried with
+`recover` and the independent manifest digest; ordinary `restore` fails closed
+before touching that lineage.
+
+Snapshot, restore, recover and member lifecycle commands share a private
+per-cluster cross-process lock so separate APC processes cannot overlap
+quorum-sensitive operations.
 
 The live 2026-07-20 restore returned 3/3 Ready and changed a ConfigMap from its
 after-snapshot value back to the before-snapshot value. The existing Helm
 release, three topology-spread Ready Pods and PodDisruptionBudget remained
 present, the recovery journal reached `completed`, and the launchd proxy
-continued serving `https://127.0.0.1:17442`. This does not expand the contract:
-replacement-host and token-loss DR remain unsupported, and physical HA still
-requires three independent Macs.
+continued serving `https://127.0.0.1:17442`.
+
+A separate destructive gate removed the local configuration, current token,
+network, all three volumes and VMs, then recovered the exact topology on the
+same physical Mac. It returned 3/3 embedded-etcd Ready and retained the Helm
+release, ConfigMap, PodDisruptionBudget and three Pods on three virtual nodes.
+The skip-egress doctor reported 34 passes, three expected warnings and zero
+failures. The package directory was `0700`, manifest `0400`, snapshot and token
+`0600`, and the recovered token and kubeconfig `0600`; temporary staging and
+the helper were absent after completion.
+
+This proves same-Mac empty-host reconstruction, including on-host token loss
+and loss of all three volumes. A later replacement-Mac drill validated the
+package, independent manifest digest and seed-member etcd reset, but peers could
+not route to the stored stable address through the target host's newer
+`apple/container` vmnet. APC failed closed, retained diagnostic state until it
+was explicitly inspected, and the disposable drill cluster was then removed.
+Replacement-Mac and off-host recovery remain unsupported and are tracked in
+[issue #9](https://github.com/buberlo/apple-pod-control/issues/9).
 
 Apple container 1.0 assigns a dynamic primary IPv4 independently of the MAC
 requested on `container run` and offers no fixed-IPv4 reservation there. APC
 checks peer reservations and the new primary address before K3s starts or a
-restore resets etcd. On collision it removes only the exact APC-owned envelope
-and retries under fixed attempt, command and probe bounds. The immediately
-preceding exact envelope identity is migrated one member at a time through the
-quorum-safe path; foreign or mismatched envelopes fail closed.
+restore/recover reset mutates etcd. On collision it removes only the exact
+APC-owned envelope and retries under fixed attempt, command and probe bounds.
+The immediately preceding exact envelope identity is migrated one member at a
+time through the quorum-safe path; foreign or mismatched envelopes fail closed.
 
 ## Network policy and host firewall
 
@@ -314,9 +408,10 @@ checks the loaded system launchd service and requires a complete live PF anchor.
 previous daemon configuration if any step fails.
 
 On 2026-07-20 both the persistent PF install and privileged `firewall status`
-check passed on both test Macs. A real reboot, a connection attempt from an
-unlisted peer and the authenticated-overlay repetition remain unproven and must
-not be inferred from the running-state result.
+check passed on both test Macs. A headless Mac mini reboot subsequently
+reconstructed its complete six-rule anchor and live PF reference. The MacBook
+reboot, a connection attempt from an unlisted peer, uninstall rollback and the
+authenticated-overlay repetition remain unproven.
 
 ### Authenticated host overlay
 
@@ -377,16 +472,17 @@ The deep doctor runs only when both the mutation authorization and doctor input
 are explicitly enabled. It does not check out repository code on either
 self-hosted Mac and uploads redacted diagnostics.
 
-The dedicated `apc-macbook` and `apc-macmini` runner labels are declared, but
-the runners are not registered with GitHub yet. Therefore the workflow itself
-is still pending even though the equivalent local read-only harness passed.
+The two hardware runners are registered, installed through
+the hardened root-owned installer as root-owned system LaunchDaemons, and were
+reported by GitHub as online and idle. The Mac mini returned online after a
+headless reboot; the MacBook runner reboot remains open. The lab currently uses
+administrator accounts instead of the recommended dedicated unprivileged
+runner accounts. The workflow itself remains pending until
+reviewed code reaches the default branch, even though the equivalent local
+read-only harness passed. See the
+[hardware-runner guide](hardware-runners.md) for the trust and account model.
 
-## APC v1 compatibility
-
-If no current v2 cluster exists, overlapping commands retain their APC v1
-behavior. Once a v2 context is selected, use `--legacy` explicitly:
-
-```bash
-apc --legacy get pods -o wide
-apc --legacy apply -f examples/deployment.yaml
-```
+The saved two-Mac worker is currently stopped because DHCP changes made its
+stored K3s server URL and host advertise addresses stale. It should be rejoined
+only after reserving stable LAN addresses or selecting a stable authenticated
+overlay; this document does not claim that topology is currently Ready.

@@ -40,9 +40,16 @@ func (execRunner) Run(ctx context.Context, binary string, arguments ...string) (
 }
 
 type Manager struct {
-	runner commandRunner
-	uid    int
-	home   string
+	runner                 commandRunner
+	uid                    int
+	euid                   int
+	home                   string
+	launchDaemonsDirectory string
+	lookupAccount          accountLookup
+	lookupGroup            groupLookup
+	chown                  fileChown
+	ownership              ownershipLookup
+	directoryOpenedHook    func(string)
 }
 
 func NewManager() (*Manager, error) {
@@ -50,7 +57,12 @@ func NewManager() (*Manager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve home directory: %w", err)
 	}
-	return &Manager{runner: execRunner{}, uid: os.Getuid(), home: home}, nil
+	return &Manager{
+		runner: execRunner{}, uid: os.Getuid(), euid: os.Geteuid(), home: home,
+		launchDaemonsDirectory: "/Library/LaunchDaemons",
+		lookupAccount:          defaultAccountLookup, lookupGroup: defaultGroupLookup,
+		chown: defaultFileChown, ownership: defaultOwnershipLookup,
+	}, nil
 }
 
 func (m *Manager) Install(ctx context.Context, config Config) (string, error) {

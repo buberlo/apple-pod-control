@@ -1,159 +1,132 @@
-# ADR 0001: Use K3s as APC v2's Kubernetes control plane
+# ADR 0001: Use K3s as APC's Kubernetes control plane
 
-- Status: Accepted for the v2 spike
-- Date: 2026-07-17
+- Status: Accepted and implemented
+- Decision date: 2026-07-17
+- Amended: 2026-07-20
 
 ## Context
 
-APC v1 implements a small Kubernetes-shaped REST API, SQLite desired-state
-storage, a scheduler and a reconciler. Recreating more Kubernetes APIs would
-make Helm, operators, Services, Secrets, Jobs and the wider ecosystem depend on
-an increasingly complex compatibility layer.
+The first APC prototype implemented a Kubernetes-shaped API, its own workload
+store, scheduler, controller and host agent. Extending that approach far enough
+to support Helm, Services, Secrets, Jobs, admission, operators and the wider
+Kubernetes ecosystem would require maintaining a second, incomplete
+Kubernetes-compatible control plane.
 
-APC v2 instead needs to provide real Kubernetes semantics while retaining the
-Apple-specific value: lifecycle and networking for lightweight ARM64 Linux VMs
-created by `apple/container`.
+The valuable project-specific work is instead at the Apple host boundary:
+creating native ARM64 node VMs with `apple/container`, retaining their data,
+moving images into nested containerd, diagnosing VM/LAN paths and safely
+supervising, backing up and recovering clusters.
 
 ## Decision
 
-APC v2 uses K3s as the Kubernetes distribution. APC owns the Apple host and
-node-VM lifecycle; Kubernetes owns workload desired state, scheduling and
-reconciliation.
+K3s is APC's only Kubernetes control plane. K3s owns:
 
-The first node envelope is an `apple/container run` VM containing the official
-K3s image. `container machine` remains a future option, but Apple container 1.0
-does not expose host-port publishing on `container machine create`. The
-Kubernetes API and cross-host CNI therefore cannot currently be made reachable
-with that interface alone.
+- the Kubernetes API and authentication;
+- desired state, controllers and reconciliation;
+- scheduling, Pods, Deployments, Services, Secrets and the Kubernetes object
+  model;
+- the single-server datastore or embedded-etcd quorum;
+- kubelet, containerd and in-node CNI behavior.
 
-The spike pins:
+APC owns:
 
-- K3s `v1.36.2+k3s1`
-- OCI index digest
-  `sha256:6a47cea22c4b834d4ba72c89d291696b79ebe406251f90b446e4dff03513dd87`
-- Linux/ARM64, without Rosetta
-- four virtual CPUs and 4 GiB RAM by default
-- Flannel VXLAN
-- API port `16443` inside and outside the server VM while APC v1 remains live
-- labelled Apple volumes for persistent K3s state
+- Apple node-VM and persistent-volume lifecycle;
+- protected kubeconfig generation and cluster selection;
+- single-server, agent and local three-server HA operations;
+- host-mediated ARM64 image transport;
+- deep outer-VM and cross-node diagnostics;
+- macOS PF/overlay integration and launchd supervision;
+- K3s backup, snapshot, restore and recovery orchestration.
 
-The `apc` CLI becomes the cluster-lifecycle interface. Native `kubectl` and
-Helm operate on the generated kubeconfig. The temporary `apc kubectl` command
-uses K3s's bundled client as a bootstrap convenience, not as a replacement for
-native Kubernetes tooling.
+The former custom control-plane and agent implementation is retired, including
+its API, database, scheduler, controller, protocol definitions, binaries and
+CLI compatibility mode. It remains visible only in Git history; it is not a
+supported product path. The repository builds and installs one binary, `apc`.
 
-For workload operations, an active APC context makes kubectl-compatible top
-level commands such as `apc get`, `apc apply`, `apc logs` and `apc exec` launch
-the native kubectl process with the APC-managed kubeconfig and inherited
-standard I/O. This preserves watches, interactive terminals, plugins, exit
-behavior and future Kubernetes flags. `--legacy` explicitly retains access to
-the APC v1 REST API; APC does not build a second Kubernetes command parser.
+## Command and API boundary
 
-APC also owns an end-to-end cluster health gate because Kubernetes Node
-`Ready` does not cover the outer Apple VM's LAN/NAT state. `apc cluster doctor`
-uses disposable node-pinned Pods to verify DNS, egress, ClusterIP, kubelet exec
-and every directed cross-node HTTP path. Cross-node application traffic is the
-VXLAN acceptance test; merely binding or sending UDP 8472 is not sufficient.
+Cluster/node/host commands are implemented by APC. Kubernetes workload commands
+such as `apc get`, `apc apply`, `apc logs` and `apc exec` invoke native kubectl
+with an APC-managed kubeconfig and inherited standard streams. `apc helm`
+similarly invokes native Helm. Direct kubectl and Helm remain first-class.
 
-Because Apple-VM public egress may fail independently of the macOS host, APC
-uses the host image store as the distribution source. OCI archives are streamed
-into K3s containerd locally and over authenticated SSH to agents. Workloads can
-therefore use `imagePullPolicy: Never` as a deterministic air-gap acceptance
-test without adding a second registry service to the spike.
+This preserves upstream watches, server-side apply, interactive terminals,
+plugins, exit behavior, object schemas and future flags. APC does not build a
+second Kubernetes command parser and does not persist workload objects.
 
-## Verified on Apple container 1.0
+`apc kubectl CLUSTER -- ...` uses K3s's bundled client as a bootstrap
+convenience when native kubectl is not installed; it is not the normal workload
+interface.
 
-The following was exercised on an Apple Silicon MacBook with
-`apple/container` 1.0.0:
+## Runtime choices
 
-1. The K3s API server, SQLite datastore, controller manager, scheduler,
-   containerd and kubelet start in the Apple VM.
-2. The node becomes Kubernetes `Ready` on the native ARM64 kernel.
-3. Flannel VXLAN creates Pod networking successfully.
-4. CoreDNS resolves a ClusterIP Service from another Pod.
-5. A nested nginx Pod serves HTTP.
-6. Host `kubectl` 1.36.2 reaches the published API.
-7. Helm installs and waits for the example `apc-web` release.
-8. `kubectl port-forward` exposes that Service to the Mac host.
-9. Re-running `apc cluster create` adopts the existing APC-labelled node
-   instead of recreating it.
-10. The generated kubeconfig is stored with mode `0600`.
-11. A second physical Mac joins as an agent and reaches `Ready`.
-12. Helm places one nginx replica on each Mac, and Pod-to-Pod HTTP, DNS,
-    ClusterIP, logs and exec work across the two physical hosts.
+The implementation pins:
 
-## Rejected networking option
+- K3s `v1.36.2+k3s1`;
+- the official K3s multi-platform OCI image by immutable digest;
+- native Linux/ARM64 without Rosetta;
+- four virtual CPUs and 4 GiB RAM for a default server node;
+- Flannel VXLAN because the Apple container 1.0 guest kernel does not support
+  WireGuard-native Flannel;
+- API port `16443` both inside and outside a server VM;
+- APC-labelled Apple volumes for `/var/lib/rancher/k3s`.
 
-`wireguard-native` was tested first because it is attractive for cross-host
-encryption. K3s reached control-plane startup but Flannel terminated with:
+The API defaults to loopback. Cross-host use requires explicit host identities,
+peer-restricted PF rules and either a trusted LAN or authenticated host overlay.
+VXLAN is not encrypted by PF.
 
-```text
-could not create wireguard interface: operation not supported
-```
+## Pod and VM model
 
-The Apple container 1.0 guest kernel therefore cannot be treated as having a
-WireGuard interface. APC's preflight and bootstrap must not select this backend
-for this runtime version.
+One APC node maps to one Apple ARM64 VM containing K3s, containerd and kubelet.
+Kubernetes schedules multiple ordinary Pods inside that node VM. A Kubernetes
+Pod does not map to an individual Apple VM. Micro-VM-per-Pod would be a separate
+Virtual Kubelet/runtime-provider design and is outside this decision.
 
-## Two-host networking result
+## Health and image consequences
 
-The MacBook plus Mac mini test uses the following envelope:
+Kubernetes Node `Ready` does not cover the outer Apple VM's NAT or routed
+cross-host path. APC therefore retains an end-to-end doctor that creates
+short-lived node-pinned Pods and verifies DNS, optional egress, ClusterIP,
+kubelet exec and every directed cross-node HTTP path. HA diagnostics also
+validate local embedded-etcd health and exact peer topology.
 
-- publish TCP 16443 on the server, matching K3s's internal listen port;
-- publish UDP 8472 on each physical Mac;
-- publish TCP 10250 on each physical Mac;
-- use the physical Mac's LAN address as K3s `--node-external-ip`;
-- enable K3s `--flannel-external-ip`.
+Apple VM registry egress can fail independently of the macOS host. APC can
+pull ARM64 images through the host, export a private OCI archive and import the
+same reference into nested K3s containerd locally or over key-authenticated
+SSH. This is an image-availability path, not a general NAT repair.
 
-The first full run passed bidirectional Pod-to-Pod HTTP, DNS, ClusterIP, logs,
-exec and Helm scheduling across both hosts. Restart testing then exposed two
-Apple container 1.0 behaviors that APC has to absorb:
+## Persistence and HA consequences
 
-1. the private VM address can change even when a deterministic MAC is used;
-2. a port-published VM can lose outbound routing after restart.
+Node VM envelopes are disposable while named Apple volumes retain K3s state.
+The local HA mode runs three K3s/embedded-etcd server VMs, but all three share
+one Mac and therefore one physical failure domain.
 
-APC therefore resolves the private address inside every boot. On first create
-it records that address as the Kubernetes `InternalIP`; replacement envelopes
-bind it as a secondary guest address and continue passing it to K3s as
-`--node-ip`, while Apple's new primary address remains available for NAT. K3s
-data is stored on an Apple named volume, while `start` recreates the disposable
-VM envelope instead of invoking `container start`.
-During an early restart run, outbound routing from every Apple VM on the
-MacBook remained unavailable even after restarting the Apple container service,
-while the macOS host and the Mac mini VMs remained healthy. Later recovery and
-simultaneous-restart runs passed both cross-host directions; the deep doctor is
-retained because the host-runtime failure can otherwise leave Kubernetes Nodes
-superficially `Ready`. The detailed evidence is in [the spike
-report](../k3s-spike-results.md).
-
-K3s's built-in network-policy controller initially failed to reconcile a
-changed private VM address. Retaining the Kubernetes `InternalIP` removes that
-failure mode. The controller subsequently survived consecutive agent and
-server envelope replacements, and cross-host tests verified default-deny plus
-label-selected TCP ingress. New APC clusters therefore enable it by default.
+Same-Mac empty-host recovery is live-proven. Replacement-Mac recovery is not:
+the package, independent manifest digest and seed etcd reset passed, but peers
+could not route to the stored stable secondary address through the target
+host's newer `apple/container` vmnet. APC failed closed. Portable member
+addressing is required before off-host recovery can become supported.
 
 ## Security consequences
 
-The official K3s container requires broad Linux capabilities inside its own
-dedicated Apple VM. This is a larger guest privilege set than APC v1 workload
-VMs, but it does not grant macOS host privileges. APC still limits mounts and
-does not expose the macOS home directory to the node.
+The official K3s image needs broad Linux capabilities inside its dedicated
+Apple VM; those do not grant macOS host privileges. APC does not mount the
+user's home directory into nodes.
 
-The API defaults to loopback. LAN mode requires an explicit advertise address.
-Kubeconfig and join tokens are credentials and must remain mode `0600`, must
-never enter Git, and must not be printed in logs. APC renders and persists a
-dedicated macOS PF anchor that restricts API, kubelet and VXLAN ports to exact
-cluster peers; privileged installation remains an explicit administrator
-action on every Mac. UDP 8472 is still unencrypted and must never be exposed to
-an untrusted network. A trusted LAN or authenticated host overlay remains a
-deployment requirement.
+Kubeconfigs, join tokens and HA snapshot tokens are credentials and remain
+private files. Snapshot trust additionally requires the manifest digest to be
+retained separately from the package. Production use still requires an
+authenticated encrypted host network, Kubernetes secret encryption and tested
+off-host escrow/rotation.
 
 ## Consequences
 
-- Helm and standard Kubernetes APIs work without translation.
-- APC's custom scheduler, REST workload API and desired-state store become
-  legacy v1 components rather than foundations for v2.
-- A K3s node is initially one Apple VM containing several Kubernetes Pods;
-  micro-VM-per-Pod is a separate, later Virtual Kubelet provider.
-- Two physical Macs do not provide control-plane HA. Embedded-etcd HA requires
-  at least three server nodes.
+- Users get native Kubernetes and Helm semantics rather than an emulation.
+- Kubernetes ecosystem compatibility advances with the pinned K3s version.
+- APC code stays focused on Apple-specific lifecycle, safety and diagnostics.
+- There is intentionally no migration promise for objects from the retired
+  prototype; workloads are expressed as standard Kubernetes manifests or Helm
+  charts.
+- Two physical Macs provide one server plus one worker, not control-plane HA.
+- Host-level control-plane HA requires three independent physical failure
+  domains and portable, authenticated peer networking.

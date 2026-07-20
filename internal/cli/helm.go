@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -14,6 +15,8 @@ import (
 )
 
 type helmEnvironment struct {
+	getenv            func(string) string
+	currentCluster    func() (string, error)
 	lookPath          func(string) (string, error)
 	prepareKubeconfig func(context.Context, string) (string, error)
 	stat              func(string) (os.FileInfo, error)
@@ -23,6 +26,8 @@ type helmEnvironment struct {
 func defaultHelmEnvironment() helmEnvironment {
 	manager := cluster.NewManager("container")
 	return helmEnvironment{
+		getenv:            os.Getenv,
+		currentCluster:    cluster.CurrentCluster,
 		lookPath:          exec.LookPath,
 		prepareKubeconfig: manager.PrepareKubeconfig,
 		stat:              os.Stat,
@@ -53,7 +58,25 @@ func (o *options) helmCommand() *cobra.Command {
 		Args:               cobra.ArbitraryArgs,
 		RunE: func(command *cobra.Command, args []string) error {
 			environment := newHelmEnvironment()
-			name, args := helmSelectedCluster(o.clusterName(nil), args)
+			name, args, err := helmSelectedCluster(o.cluster, args)
+			if err != nil {
+				return err
+			}
+			if name == "" {
+				name = environment.getenv("APC_CLUSTER")
+			}
+			if name == "" {
+				name, err = environment.currentCluster()
+				if errors.Is(err, cluster.ErrNoCurrentCluster) {
+					return errNoSelectedCluster
+				}
+				if err != nil {
+					return fmt.Errorf("resolve current APC cluster: %w", err)
+				}
+				if name == "" {
+					return errNoSelectedCluster
+				}
+			}
 			kubeconfig, err := environment.prepareKubeconfig(command.Context(), name)
 			if err != nil {
 				return fmt.Errorf("resolve kubeconfig for cluster %q: %w", name, err)
@@ -80,20 +103,30 @@ func (o *options) helmCommand() *cobra.Command {
 // Cobra preserves persistent flags when the child disables flag parsing. APC
 // owns --cluster, so remove only that selector and leave every Helm flag byte
 // for byte untouched.
-func helmSelectedCluster(selected string, arguments []string) (string, []string) {
+func helmSelectedCluster(selected string, arguments []string) (string, []string, error) {
 	forwarded := make([]string, 0, len(arguments))
 	for index := 0; index < len(arguments); index++ {
 		argument := arguments[index]
-		if argument == "--cluster" && index+1 < len(arguments) {
+		if argument == "--" {
+			forwarded = append(forwarded, arguments[index:]...)
+			break
+		}
+		if argument == "--cluster" {
+			if index+1 >= len(arguments) || strings.HasPrefix(arguments[index+1], "-") {
+				return "", nil, fmt.Errorf("--cluster requires a name")
+			}
 			selected = arguments[index+1]
 			index++
 			continue
 		}
 		if strings.HasPrefix(argument, "--cluster=") {
 			selected = strings.TrimPrefix(argument, "--cluster=")
+			if selected == "" {
+				return "", nil, fmt.Errorf("--cluster requires a name")
+			}
 			continue
 		}
 		forwarded = append(forwarded, argument)
 	}
-	return selected, forwarded
+	return selected, forwarded, nil
 }

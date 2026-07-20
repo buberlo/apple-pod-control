@@ -73,10 +73,13 @@ type supervisorLogger struct {
 	output io.Writer
 }
 
-func (l *supervisorLogger) printf(format string, arguments ...any) {
+func (l *supervisorLogger) printf(format string, arguments ...any) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	fmt.Fprintf(l.output, "%s "+format+"\n", append([]any{time.Now().UTC().Format(time.RFC3339)}, arguments...)...)
+	if _, err := fmt.Fprintf(l.output, "%s "+format+"\n", append([]any{time.Now().UTC().Format(time.RFC3339)}, arguments...)...); err != nil {
+		return fmt.Errorf("write supervisor log: %w", err)
+	}
+	return nil
 }
 
 func (m *Manager) supervise(ctx context.Context, options SuperviseOptions, runtime supervisorRuntime) error {
@@ -89,24 +92,28 @@ func (m *Manager) supervise(ctx context.Context, options SuperviseOptions, runti
 		return runtime.reconcile(ctx, options)
 	}
 	var stopProxy context.CancelFunc
-	var proxyDone <-chan struct{}
+	var proxyDone <-chan error
+	proxyResultRead := false
 	if options.Role == "ha" {
 		proxyCtx, cancelProxy := context.WithCancel(ctx)
-		done := make(chan struct{})
+		done := make(chan error, 1)
 		stopProxy = cancelProxy
 		proxyDone = done
 		go func() {
-			defer close(done)
-			superviseHAProxy(proxyCtx, options.Name, runtime, logger)
+			done <- superviseHAProxy(proxyCtx, options.Name, runtime, logger)
 		}()
 		defer func() {
 			stopProxy()
-			<-proxyDone
+			if !proxyResultRead {
+				<-proxyDone
+			}
 		}()
 	}
 
 	if err := reconcile(); err != nil {
-		logger.printf("reconcile failed: %v", err)
+		if logErr := logger.printf("reconcile failed: %v", err); logErr != nil {
+			return errors.Join(fmt.Errorf("supervisor reconcile failed: %w", err), logErr)
+		}
 	}
 	ticker := time.NewTicker(options.Interval)
 	defer ticker.Stop()
@@ -114,15 +121,26 @@ func (m *Manager) supervise(ctx context.Context, options SuperviseOptions, runti
 		select {
 		case <-ctx.Done():
 			return nil
+		case proxyErr := <-proxyDone:
+			proxyResultRead = true
+			if proxyErr != nil {
+				return proxyErr
+			}
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("HA API proxy supervisor stopped unexpectedly")
 		case <-ticker.C:
 			if err := reconcile(); err != nil {
-				logger.printf("reconcile failed: %v", err)
+				if logErr := logger.printf("reconcile failed: %v", err); logErr != nil {
+					return errors.Join(fmt.Errorf("supervisor reconcile failed: %w", err), logErr)
+				}
 			}
 		}
 	}
 }
 
-func superviseHAProxy(ctx context.Context, name string, runtime supervisorRuntime, logger *supervisorLogger) {
+func superviseHAProxy(ctx context.Context, name string, runtime supervisorRuntime, logger *supervisorLogger) error {
 	retry := runtime.proxyInitialRetry
 	if retry <= 0 {
 		retry = haProxySupervisorInitialRetry
@@ -134,12 +152,16 @@ func superviseHAProxy(ctx context.Context, name string, runtime supervisorRuntim
 	for {
 		err := runtime.serveHAProxy(ctx, name)
 		if ctx.Err() != nil {
-			return
+			return nil
 		}
 		if err == nil {
-			logger.printf("HA API proxy stopped unexpectedly; retrying in %s", retry)
+			if logErr := logger.printf("HA API proxy stopped unexpectedly; retrying in %s", retry); logErr != nil {
+				return logErr
+			}
 		} else {
-			logger.printf("HA API proxy failed: %v; retrying in %s", err, retry)
+			if logErr := logger.printf("HA API proxy failed: %v; retrying in %s", err, retry); logErr != nil {
+				return logErr
+			}
 		}
 
 		timer := time.NewTimer(retry)
@@ -151,7 +173,7 @@ func superviseHAProxy(ctx context.Context, name string, runtime supervisorRuntim
 				default:
 				}
 			}
-			return
+			return nil
 		case <-timer.C:
 		}
 		if retry < maximumRetry {
@@ -364,12 +386,13 @@ func ensureHARecoveryJournalAllowsSupervision(name string) error {
 	if err != nil {
 		return fmt.Errorf("refusing HA supervision because the protected recovery journal cannot be trusted: %w", err)
 	}
-	runtimeSafe := journal.RecoverySucceeded &&
-		(journal.Phase == "completed" || (journal.Phase == "failed" && journal.RecoveryAttempted))
-	if runtimeSafe {
+	if haRecoveryJournalRuntimeSafe(journal) {
 		return nil
 	}
 	action := fmt.Sprintf("rerun `apc cluster ha restore %s --from %q --yes` to resume or retry recovery", name, journal.SnapshotPath)
+	if haRecoveryJournalRequiresRecover(journal) {
+		action = fmt.Sprintf("rerun `apc cluster ha recover %s` with the same snapshot package and its independently retained manifest SHA-256", name)
+	}
 	return fmt.Errorf("refusing HA VM reconciliation while recovery journal is in nonterminal phase %q (recoverySucceeded=%t); %s", journal.Phase, journal.RecoverySucceeded, action)
 }
 

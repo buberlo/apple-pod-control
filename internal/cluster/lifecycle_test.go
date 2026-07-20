@@ -15,6 +15,26 @@ type contextBlockingRunner struct {
 	calls   atomic.Int32
 }
 
+type failingSupervisorWriter struct{}
+
+func (failingSupervisorWriter) Write([]byte) (int, error) {
+	return 0, errors.New("log sink unavailable")
+}
+
+func TestSupervisorPropagatesPersistentLogSinkFailure(t *testing.T) {
+	manager := NewManager("container")
+	err := manager.supervise(context.Background(), SuperviseOptions{
+		Role: "server", Name: "home", Interval: time.Second, Output: failingSupervisorWriter{},
+	}, supervisorRuntime{
+		reconcile: func(context.Context, SuperviseOptions) error {
+			return errors.New("persistent reconcile failure")
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "persistent reconcile failure") || !strings.Contains(err.Error(), "log sink unavailable") {
+		t.Fatalf("supervisor logging error = %v", err)
+	}
+}
+
 func (runner *contextBlockingRunner) Run(ctx context.Context, _ string, _ ...string) ([]byte, []byte, error) {
 	runner.calls.Add(1)
 	select {
@@ -138,6 +158,38 @@ func TestHASupervisorFailsClosedOnNonterminalRecoveryJournal(t *testing.T) {
 	}
 	if len(runner.calls) != 0 || len(runner.mutations) != 0 {
 		t.Fatalf("nonterminal recovery journal allowed runtime access: calls=%#v mutations=%#v", runner.calls, runner.mutations)
+	}
+}
+
+func TestHASupervisorDirectsRecoverOnlyJournalBackToRecoverHA(t *testing.T) {
+	manager, runner, config := newHAMemberLifecycleFixture(t)
+	now := time.Now().UTC()
+	journal := HARecoveryState{
+		APIVersion:        haSnapshotAPIVersion,
+		Kind:              haRecoveryStateKind,
+		Cluster:           config.Name,
+		ClusterIdentity:   strings.Repeat("a", 64),
+		SnapshotPath:      "/private/tmp/ha-lab.snapshot",
+		Phase:             "failed",
+		StartedAt:         now,
+		UpdatedAt:         now,
+		RecoveryAttempted: true,
+		VolumeProvenance: &HARecoveryVolumeProvenance{
+			NewMemberIDs: []int{1, 2, 3},
+		},
+	}
+	if err := saveHARecoveryState(journal); err != nil {
+		t.Fatal(err)
+	}
+	err := manager.reconcileSupervisedHAAfterService(context.Background(), SuperviseOptions{Role: "ha", Name: config.Name}, newHASupervisorState())
+	if err == nil ||
+		!strings.Contains(err.Error(), "apc cluster ha recover") ||
+		!strings.Contains(err.Error(), "independently retained manifest SHA-256") ||
+		strings.Contains(err.Error(), "apc cluster ha restore") {
+		t.Fatalf("recover-only journal gate error = %v", err)
+	}
+	if len(runner.calls) != 0 || len(runner.mutations) != 0 {
+		t.Fatalf("recover-only journal allowed runtime access: calls=%#v mutations=%#v", runner.calls, runner.mutations)
 	}
 }
 

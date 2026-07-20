@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/buberlo/apple-pod-control/internal/cluster"
@@ -98,9 +99,9 @@ func TestKubernetesPassthroughForwardsFutureCommandsAndPlugins(t *testing.T) {
 	}
 }
 
-func TestKubernetesPassthroughLeavesLegacyAndLifecycleCommandsToCobra(t *testing.T) {
+func TestKubernetesPassthroughLeavesAPCAndCompletionCommandsToCobra(t *testing.T) {
 	env, captured := passthroughTestEnvironment(t)
-	for _, arguments := range [][]string{{"--legacy", "get", "pods"}, {"cluster", "status"}, {"config", "current-cluster"}} {
+	for _, arguments := range [][]string{{"cluster", "status"}, {"config", "current-cluster"}, {"completion", "zsh"}, {"__complete", "cluster", "st"}, {"__completeNoDesc", "config", "current-"}} {
 		handled, err := tryKubernetesPassthrough(context.Background(), arguments, nil, io.Discard, io.Discard, env)
 		if err != nil || handled {
 			t.Fatalf("arguments = %#v, handled = %t, err = %v", arguments, handled, err)
@@ -111,12 +112,18 @@ func TestKubernetesPassthroughLeavesLegacyAndLifecycleCommandsToCobra(t *testing
 	}
 }
 
-func TestKubernetesPassthroughFallsBackToV1WithoutCurrentCluster(t *testing.T) {
+func TestKubernetesPassthroughRequiresSelectedCluster(t *testing.T) {
 	env, _ := passthroughTestEnvironment(t)
 	env.currentCluster = func() (string, error) { return "", cluster.ErrNoCurrentCluster }
 	handled, err := tryKubernetesPassthrough(context.Background(), []string{"get", "pods"}, nil, io.Discard, io.Discard, env)
-	if err != nil || handled {
+	if !handled || err == nil {
 		t.Fatalf("handled = %t, err = %v", handled, err)
+	}
+	if !errors.Is(err, errNoSelectedCluster) {
+		t.Fatalf("error = %v, want no-selected-cluster sentinel", err)
+	}
+	if message := err.Error(); !strings.Contains(message, "apc config use-cluster NAME") || !strings.Contains(message, "--cluster NAME") {
+		t.Fatalf("error = %q, want actionable cluster selection guidance", message)
 	}
 }
 

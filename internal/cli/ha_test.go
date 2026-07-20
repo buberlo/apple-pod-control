@@ -24,6 +24,11 @@ type fakeHAManager struct {
 	restoreName  string
 	restorePath  string
 	restoreCalls int
+	recoverName  string
+	recoverPath  string
+	recoverHash  string
+	recoverWait  time.Duration
+	recoverCalls int
 	memberName   string
 	memberID     int
 	memberOp     string
@@ -66,6 +71,15 @@ func (m *fakeHAManager) RestoreHA(_ context.Context, name, input string, _ time.
 	return m.startState, nil
 }
 
+func (m *fakeHAManager) RecoverHA(_ context.Context, name, input, expectedManifestSHA256 string, timeout time.Duration) (cluster.HAState, error) {
+	m.recoverName = name
+	m.recoverPath = input
+	m.recoverHash = expectedManifestSHA256
+	m.recoverWait = timeout
+	m.recoverCalls++
+	return m.startState, nil
+}
+
 func (m *fakeHAManager) StopHAMember(_ context.Context, name string, id int, _ time.Duration) (cluster.HAState, error) {
 	m.memberName, m.memberID, m.memberOp = name, id, "stop"
 	return m.statusState, nil
@@ -85,7 +99,7 @@ func (*fakeHAManager) ServeHAProxy(context.Context, string) error { return nil }
 
 func TestClusterHACommandRegistersLifecycleCommands(t *testing.T) {
 	command := (&options{}).clusterHACommand()
-	want := []string{"create", "delete", "member", "proxy", "restore", "snapshot", "start", "status", "stop"}
+	want := []string{"create", "delete", "member", "proxy", "recover", "restore", "snapshot", "start", "status", "stop"}
 	got := make([]string, 0, len(command.Commands()))
 	for _, child := range command.Commands() {
 		got = append(got, child.Name())
@@ -96,7 +110,7 @@ func TestClusterHACommandRegistersLifecycleCommands(t *testing.T) {
 }
 
 func TestClusterHASnapshotForwardsProtectedOutput(t *testing.T) {
-	fake := &fakeHAManager{snapshot: cluster.HASnapshotResult{Path: "/secure/snapshot", Bytes: 42, DataSHA256: "abc", Warning: "in-cluster cleanup pending"}}
+	fake := &fakeHAManager{snapshot: cluster.HASnapshotResult{Path: "/secure/snapshot", Bytes: 42, DataSHA256: "abc", ManifestSHA256: "def", Warning: "in-cluster cleanup pending"}}
 	previous := newHAManager
 	newHAManager = func() haManager { return fake }
 	t.Cleanup(func() { newHAManager = previous })
@@ -110,11 +124,38 @@ func TestClusterHASnapshotForwardsProtectedOutput(t *testing.T) {
 	if fake.snapshotName != "ha-lab" || fake.snapshotPath != "/secure/snapshot" {
 		t.Fatalf("snapshot call = cluster %q, path %q", fake.snapshotName, fake.snapshotPath)
 	}
-	if !strings.Contains(output.String(), "snapshot.apc.dev created: /secure/snapshot (42 bytes") || strings.Contains(output.String(), "token") {
+	if !strings.Contains(output.String(), "manifest-sha256:def") || strings.Contains(output.String(), "token") {
 		t.Fatalf("unexpected snapshot output: %s", output.String())
 	}
-	if !strings.Contains(errorOutput.String(), "warning: in-cluster cleanup pending") {
+	if !strings.Contains(errorOutput.String(), "retain the manifest SHA-256 separately") || !strings.Contains(errorOutput.String(), "warning: in-cluster cleanup pending") {
 		t.Fatalf("snapshot warning was not surfaced: %s", errorOutput.String())
+	}
+}
+
+func TestClusterHARecoverRequiresConfirmationAndForwardsTrustAnchor(t *testing.T) {
+	fake := &fakeHAManager{startState: cluster.HAState{Name: "ha-lab", ReadyMembers: 3}}
+	previous := newHAManager
+	newHAManager = func() haManager { return fake }
+	t.Cleanup(func() { newHAManager = previous })
+	hash := strings.Repeat("a", 64)
+
+	command := (&options{out: &bytes.Buffer{}, errOut: &bytes.Buffer{}}).clusterHACommand()
+	command.SetArgs([]string{"recover", "ha-lab", "--from", "/secure/snapshot", "--expected-manifest-sha256", hash})
+	if err := command.Execute(); err == nil || !strings.Contains(err.Error(), "without --yes") || fake.recoverCalls != 0 {
+		t.Fatalf("unconfirmed recovery error = %v, calls = %d", err, fake.recoverCalls)
+	}
+
+	var output bytes.Buffer
+	command = (&options{out: &output, errOut: &bytes.Buffer{}}).clusterHACommand()
+	command.SetArgs([]string{"recover", "ha-lab", "--from", "/secure/snapshot", "--expected-manifest-sha256", hash, "--wait", "7m", "--yes"})
+	if err := command.Execute(); err != nil {
+		t.Fatalf("confirmed recovery: %v", err)
+	}
+	if fake.recoverCalls != 1 || fake.recoverName != "ha-lab" || fake.recoverPath != "/secure/snapshot" || fake.recoverHash != hash || fake.recoverWait != 7*time.Minute {
+		t.Fatalf("recover call = name %q path %q hash %q wait %s calls %d", fake.recoverName, fake.recoverPath, fake.recoverHash, fake.recoverWait, fake.recoverCalls)
+	}
+	if !strings.Contains(output.String(), "recovered and ready (3/3 servers)") || strings.Contains(strings.ToLower(output.String()), "token") {
+		t.Fatalf("unexpected recovery output: %s", output.String())
 	}
 }
 

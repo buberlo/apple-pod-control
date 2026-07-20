@@ -164,6 +164,19 @@ An image on only one member is insufficient because Kubernetes may reschedule
 a Pod to either of the other members. Prefer ARM64 or multi-platform images so
 the Apple Silicon hosts do not need x86 translation.
 
+For an air-gapped empty-host recovery, the host image store must already hold
+the exact references selected by the pinned K3s build for pause 3.6, CoreDNS
+1.14.4, local-path-provisioner 0.0.36 and metrics-server 0.8.1, plus all
+workload images. The recovered member stores are fresh. After the three volumes
+and member envelopes exist, import the complete set from the host cache before
+expecting K3s and workloads to become Ready:
+
+```bash
+apc --cluster ha-lab image prefetch --pull=false \
+  EXACT_PAUSE_IMAGE EXACT_COREDNS_IMAGE EXACT_LOCAL_PATH_IMAGE \
+  EXACT_METRICS_SERVER_IMAGE EXACT_WORKLOAD_IMAGE
+```
+
 ## Deep diagnostics
 
 The same end-to-end doctor understands protected HA configurations:
@@ -208,12 +221,12 @@ non-learner and report exactly the other two server IDs as peers. Exactly one
 member must report the leader role. Any mismatch fails before the stop call,
 even when all Kubernetes Nodes and APIs appear Ready.
 
-Snapshot, restore and member stop/start/restart acquire one private per-cluster
-cross-process file lock. Independent `apc` processes therefore cannot overlap
-these quorum-sensitive operations. Lock waiting respects the command context
-and timeout.
+Snapshot, restore, recover and member stop/start/restart acquire one private
+per-cluster cross-process file lock. Independent `apc` processes therefore
+cannot overlap these quorum-sensitive operations. Lock waiting respects the
+command context and timeout.
 
-## HA snapshot and in-place restore
+## HA snapshot, in-place restore and empty-host recovery
 
 The single-server `apc cluster backup` format is not valid for embedded-etcd
 HA. Use the dedicated commands and a destination directory that does not yet
@@ -223,9 +236,15 @@ exist:
 umask 077
 snapshot="$HOME/Backups/ha-lab-2026-07-20"
 apc cluster ha snapshot ha-lab --output "$snapshot"
+# Copy the printed manifest-sha256 to separately protected storage.
+manifest_sha256=MANIFEST_SHA256
 
 # Destructive rollback of this same saved cluster:
 apc cluster ha restore ha-lab --from "$snapshot" --yes --wait 5m
+
+# Alternative for an intentionally empty local host state:
+apc cluster ha recover ha-lab --from "$snapshot" \
+  --expected-manifest-sha256 "$manifest_sha256" --yes --wait 5m
 ```
 
 Snapshot requires all three members to be Ready and the same exact three-member
@@ -235,6 +254,11 @@ quorum, copies the snapshot and matching server token outside all member
 volumes, checks sizes and SHA-256 digests, restarts the member and publishes a
 private package only after the cluster is 3/3 Ready again. The package contains
 exactly the etcd snapshot, the server token and a read-only manifest.
+
+Snapshot prints the manifest SHA-256. Retain that value separately from the
+package: the manifest stored beside the snapshot is not an independent trust
+anchor for empty-host recovery. `recover` requires the separately retained
+value through `--expected-manifest-sha256`.
 
 apple/container attaches a VM to its default network when no network is
 specified. The first live snapshot exposed that a recovery-helper validator
@@ -250,6 +274,19 @@ off-host copy, and never print, email or commit the token. Losing the token can
 make K3s bootstrap data in the snapshot unusable; disclosing it compromises the
 cluster.
 
+Restore and recover have intentionally different preconditions. Restore is an
+in-place rollback and requires the current saved configuration, matching
+on-host token, exact network and all three original member volumes. Recover is
+the exact empty-host reconstruction path: from the package and independently
+retained manifest digest it republishes the saved configuration and token,
+recreates the saved network and three volumes, and then runs the same
+embedded-etcd reset/rejoin sequence. It never substitutes a different topology
+or image.
+
+The external digest check occurs before recovery publishes local state. In the
+live negative gate, one wrong separately retained digest caused exactly zero
+configuration, token, network, volume or VM mutation.
+
 Restore validates the package, checksums, saved topology, image, cluster
 identity and token **before** stopping members. It then resets member 1 from the
 snapshot, clears stale etcd databases on members 2 and 3, rejoins them and
@@ -261,8 +298,11 @@ fails closed and blocks automatic VM mutations; the independently managed API
 proxy loop continues. Automatic reconciliation resumes only after a completed
 successful restore or a failed restore whose recorded automatic recovery
 successfully returned the original cluster to a runtime-safe state. Otherwise,
-rerun the explicit restore command with the validated snapshot after resolving
-the journal's reported failure.
+rerun the same explicit restore or recover command with the validated snapshot
+after resolving the journal's reported failure. A journal that records volumes
+created by empty-host recovery can only be resumed with `recover` and the
+independently retained manifest digest; `restore` rejects that lineage before
+staging or runtime access.
 
 The final live HA sequence on 2026-07-20 completed successfully:
 
@@ -277,28 +317,50 @@ The final live HA sequence on 2026-07-20 completed successfully:
 - the Helm release, three topology-spread Ready Pods and PodDisruptionBudget
   remained intact, and the recovery journal reached `completed` with recovery
   success;
-- the final deep doctor reported 34 passes, three expected warnings for
-  intentionally skipped public egress and zero failures;
+- the skip-egress deep doctor reported 34 passes, three expected warnings and
+  zero failures; a full run passed the same 34 internal checks and isolated
+  three public-HTTPS failures;
+- a host-pulled ARM64 image archive was imported and verified in all three
+  exact member stores;
 - the published package was mode `0700`, with a read-only `0400` manifest and
   `0600` snapshot and token artifacts;
 - the HA LaunchAgent continued serving the stable proxy on
   `https://127.0.0.1:17442`.
 
-This restore is deliberately an **in-place rollback**, not replacement-host
-disaster recovery. It requires all of the following current state:
+A separate destructive empty-host gate on that same physical Mac then removed
+the saved local configuration, current token, network, all three member volumes
+and VMs. With the correct external manifest digest, `recover` reconstructed the
+exact saved topology and returned all three embedded-etcd members to Ready. The
+Helm release, ConfigMap, PodDisruptionBudget and three Pods on three virtual
+nodes were preserved. The post-recovery skip-egress doctor reported 34 passes,
+three expected warnings and zero failures. The recovered token and kubeconfig
+were both mode `0600`, and temporary staging plus the recovery helper were
+removed.
 
-- the original saved HA cluster configuration and exact APC-owned network;
-- the current protected token file, matching the token inside the package;
-- all three original, exact APC-owned member volumes;
-- the saved topology and image identity recorded in the manifest.
+The operational split is deliberate:
 
-It cannot recreate a lost Mac, bootstrap a new host from the package alone,
-recover after all three volumes disappear, or substitute a different current
-token. The current implementation also does not recover from loss of the
-on-host token file even though a protected copy is present in the snapshot
-package: validation requires both to exist and match. Preserve independent
-encrypted copies, but do not describe this command as replacement-host or
-token-loss DR.
+- **Restore** is an in-place rollback and requires the original saved HA
+  configuration, exact APC-owned network, current protected token matching the
+  package, all three original volumes, and the saved topology and image.
+- **Recover** is an exact reconstruction of an empty local host state and can
+  recreate the missing configuration, current token, network and all three
+  volumes, but only for the saved topology and immutable image and only with an
+  independently retained manifest SHA-256.
+
+The same-Mac proof includes loss of the on-host token and all three volumes. A
+later replacement-Mac drill validated the copied package, independently
+retained manifest digest and exact saved topology, then successfully reset the
+seed member from the etcd snapshot. Members 2 and 3 could not route to the
+seed's stored stable secondary address through the target Mac's newer
+`apple/container` vmnet behavior and therefore could not join. APC failed
+closed, marked the operation unsuccessful, retained the member volumes for
+diagnosis and blocked automatic mutation. After inspection, the disposable
+target cluster and its temporary resources were explicitly removed.
+
+That drill is evidence for the recovery trust anchor and fail-safe behavior,
+not successful replacement-host recovery. Off-host recovery, protected escrow,
+measured RPO/RTO and HA across three physical hosts remain unsupported and are
+tracked in [issue #9](https://github.com/buberlo/apple-pod-control/issues/9).
 
 ## apple/container 1.0 runtime-address limitation
 
@@ -308,15 +370,16 @@ IPv4 allocation is independent of that requested MAC. A newly created envelope
 can therefore receive an address that APC has reserved as another etcd member's
 stable secondary address.
 
-APC guards this before K3s starts or a restore reset mutates etcd. It validates
-the current peer reservations, inspects the new envelope's runtime address and
-rejects a collision. Only the exact APC-owned conflicting envelope may be
-stopped and deleted. Creation is retried a small fixed number of times under
-bounded command and address-probe contexts; exhaustion fails closed with no
-conflicting envelope left behind. APC never deletes a foreign or merely
+APC guards this before K3s starts or a restore/recover reset mutates etcd. It
+validates the current peer reservations, inspects the new envelope's runtime
+address and rejects a collision. Only the exact APC-owned conflicting envelope
+may be stopped and deleted. Creation is retried a small fixed number of times
+under bounded command and address-probe contexts; exhaustion fails closed with
+no conflicting envelope left behind. APC never deletes a foreign or merely
 similarly named container to obtain another address.
 
-Envelopes created before this guard used a known legacy init identity. APC
+Envelopes created by the immediately preceding launch format used a known init
+identity. APC
 accepts only that exact preceding identity and migrates it one member at a time
 through the same quorum-safe stop/start path. Each migrated member must return
 Ready before reconciliation proceeds. Unknown launch arguments, labels,
@@ -350,18 +413,29 @@ Wait for 3/3 Ready before a member operation or snapshot.
 - The three-VM lab survives one VM failure, not loss or reboot of its one Mac.
   Host-level HA still needs three independent physical failure domains and
   mutually routed or overlaid peer traffic.
-- Replacement-host and token-loss disaster recovery remain open even after the
-  successful in-place restore.
+- Same-Mac recovery from a lost current token and all three lost volumes is
+  live-proven. The replacement-Mac drill failed safely after seed reset because
+  the target host could not route peer traffic to the saved stable secondary
+  address. Replacement-host recovery, protected off-host escrow and measured
+  RPO/RTO remain open in
+  [issue #9](https://github.com/buberlo/apple-pod-control/issues/9).
 - The two-Mac server/agent cluster is separate; it is not converted into this
   etcd cluster.
 - The current cross-host path is peer-restricted PF on the trusted LAN.
-  Persistence across host reboot and rejection of a non-peer are not yet live
-  proven.
+  A headless Mac mini reboot reconstructed its complete six-rule anchor and PF
+  reference. The MacBook reboot, rejection of a non-peer, uninstall rollback
+  and overlay repetition are not yet live-proven.
 - Tailscale is not installed or authenticated on the Macs. A user must install
   it, approve the macOS network configuration and complete interactive account
   authentication before overlay gates can run. APC never accepts an auth key.
-- The dedicated hardware CI runners are not registered, so the default-branch
-  hardware workflow has not yet run on the two Macs.
+- Both hardware CI runners use root-owned system LaunchDaemons and GitHub
+  reported them online and idle. The Mac mini returned online after a headless
+  reboot; the MacBook reboot and guarded default-branch workflow run remain
+  open. The lab currently uses administrator accounts, not the recommended
+  dedicated unprivileged runner accounts.
+- APC's separate root-managed unattended supervisor has deterministic
+  privilege-drop, bounded-log, exact-status and ACL-hardening coverage, but its
+  live zero-login reboot repeat remains open.
 - The MacBook's Apple VM still lacks public HTTPS egress in the tested setup.
   Host-mediated image prefetch avoids making registry reachability a scheduling
   prerequisite, but it does not repair VM NAT.

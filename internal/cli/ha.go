@@ -24,6 +24,7 @@ type haManager interface {
 	DeleteHA(context.Context, string, bool) error
 	SnapshotHA(context.Context, string, string) (cluster.HASnapshotResult, error)
 	RestoreHA(context.Context, string, string, time.Duration) (cluster.HAState, error)
+	RecoverHA(context.Context, string, string, string, time.Duration) (cluster.HAState, error)
 	StopHAMember(context.Context, string, int, time.Duration) (cluster.HAState, error)
 	StartHAMember(context.Context, string, int, time.Duration) (cluster.HAState, error)
 	RestartHAMember(context.Context, string, int, time.Duration) (cluster.HAState, error)
@@ -77,6 +78,7 @@ func (o *options) clusterHACommand() *cobra.Command {
 		o.clusterHADeleteCommand(),
 		o.clusterHASnapshotCommand(),
 		o.clusterHARestoreCommand(),
+		o.clusterHARecoverCommand(),
 		o.clusterHAMemberCommand(),
 		o.clusterHAProxyCommand(),
 	)

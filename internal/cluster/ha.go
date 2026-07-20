@@ -814,14 +814,8 @@ func (m *Manager) createHALocked(ctx context.Context, config HAConfig) (HAState,
 	}
 	createdNetwork := false
 	if !preflight.networkExists {
-		if _, stderr, runErr := m.runner.Run(ctx, m.binary,
-			"network", "create",
-			"--subnet", config.Subnet,
-			"--label", "apc.dev/managed=true",
-			"--label", "apc.dev/cluster="+config.Name,
-			config.NetworkName,
-		); runErr != nil {
-			return HAState{}, commandError("create HA network", stderr, runErr)
+		if err := m.createHAOwnedNetwork(ctx, config); err != nil {
+			return HAState{}, err
 		}
 		createdNetwork = true
 	}
@@ -830,16 +824,7 @@ func (m *Manager) createHALocked(ctx context.Context, config HAConfig) (HAState,
 		if preflight.volumeExists[member.ID] {
 			continue
 		}
-		if _, stderr, runErr := m.runner.Run(ctx, m.binary,
-			"volume", "create",
-			"--label", "apc.dev/managed=true",
-			"--label", "apc.dev/cluster="+config.Name,
-			"--label", "apc.dev/role=server",
-			"--label", "apc.dev/member="+strconv.Itoa(member.ID),
-			"-s", config.VolumeSize,
-			HAVolumeName(config.Name, member.ID),
-		); runErr != nil {
-			createErr := commandError("create HA member data volume", stderr, runErr)
+		if createErr := m.createHAOwnedVolume(ctx, config, member); createErr != nil {
 			return HAState{}, errors.Join(createErr, m.rollbackHAFreshInfrastructure(ctx, config, createdVolumes, createdNetwork))
 		}
 		createdVolumes = append(createdVolumes, member.ID)
@@ -884,6 +869,36 @@ func (m *Manager) createHALocked(ctx context.Context, config HAConfig) (HAState,
 	}
 	state.Kubeconfig = config.KubeconfigPath
 	return state, nil
+}
+
+func (m *Manager) createHAOwnedNetwork(ctx context.Context, config HAConfig) error {
+	_, stderr, err := m.runner.Run(ctx, m.binary,
+		"network", "create",
+		"--subnet", config.Subnet,
+		"--label", "apc.dev/managed=true",
+		"--label", "apc.dev/cluster="+config.Name,
+		config.NetworkName,
+	)
+	if err != nil {
+		return commandError("create HA network", stderr, err)
+	}
+	return nil
+}
+
+func (m *Manager) createHAOwnedVolume(ctx context.Context, config HAConfig, member HAMember) error {
+	_, stderr, err := m.runner.Run(ctx, m.binary,
+		"volume", "create",
+		"--label", "apc.dev/managed=true",
+		"--label", "apc.dev/cluster="+config.Name,
+		"--label", "apc.dev/role=server",
+		"--label", "apc.dev/member="+strconv.Itoa(member.ID),
+		"-s", config.VolumeSize,
+		HAVolumeName(config.Name, member.ID),
+	)
+	if err != nil {
+		return commandError("create HA member data volume", stderr, err)
+	}
+	return nil
 }
 
 func (m *Manager) rollbackHAFreshInfrastructure(ctx context.Context, config HAConfig, volumeIDs []int, networkCreated bool) error {

@@ -50,7 +50,7 @@ case "$*" in
     printf '%s\n' 'helper=/Library/PrivilegedHelperTools/apc-firewall peer=192.168.50.20'
     ;;
   *"version")
-    printf '%s\n' 'Client Version: test' 'Server Version: test'
+    printf '%s\n' 'APC Version: test'
     ;;
   *)
     printf '%s\n' 'ok peer=192.168.50.20 mac=aa:bb:cc:dd:ee:ff'
@@ -96,6 +96,14 @@ FAKE_UNAME
 cat >"$fake_bin/sw_vers" <<'FAKE_SW_VERS'
 #!/usr/bin/env bash
 if [[ "${APC_FAKE_HANG_SW_VERS:-}" == "1" ]]; then
+  if [[ -n "${APC_FAKE_CHILD_MARKER:-}" ]]; then
+    (
+      trap '' TERM INT
+      sleep 5
+      printf '%s\n' survived >"$APC_FAKE_CHILD_MARKER"
+      while :; do sleep 1; done
+    ) &
+  fi
   trap 'exit 143' TERM INT
   while :; do sleep 1; done
 fi
@@ -128,6 +136,7 @@ run_harness() {
     APC_FAKE_CALLS="$calls" \
     APC_FAKE_KUBECONFIG="$kubeconfig" \
     APC_FAKE_HANG_SW_VERS="${APC_FAKE_HANG_SW_VERS:-}" \
+    APC_FAKE_CHILD_MARKER="${APC_FAKE_CHILD_MARKER:-}" \
     "$harness" "$@"
 }
 
@@ -190,9 +199,15 @@ if ((SECONDS - agent_started > 10)); then
   exit 1
 fi
 grep -q 'apc node status lan-spike' "$calls"
+grep -q 'apc version$' "$calls"
+if grep -q 'apc version --client' "$calls"; then
+  printf '%s\n' 'agent mode used the retired client/server version split' >&2
+  exit 1
+fi
 grep -q 'container exec apc-k3s-lan-spike-agent /bin/k3s --version' "$calls"
 grep -q '^status=complete$' "$agent_output/sanitization.txt"
 grep -q $'^WARN\tfirewall-status\t' "$agent_output/results.tsv"
+grep -q $'^PASS\tapc-version\t' "$agent_output/results.tsv"
 if grep -qE $'^(PASS|WARN|FAIL)\t(tool-kubectl|tool-helm|kubectl-client-version|helm-client-version)\t' "$agent_output/results.tsv"; then
   printf '%s\n' 'agent mode unexpectedly required control-plane administration tools' >&2
   exit 1
@@ -208,8 +223,9 @@ if run_harness --role server --cluster '../unsafe' --output "$test_root/invalid"
 fi
 
 timeout_output="$test_root/server-timeout"
+child_marker="$test_root/watchdog-child-survived"
 timeout_started=$SECONDS
-if APC_FAKE_HANG_SW_VERS=1 run_harness --role server --cluster lan-spike --output "$timeout_output" --check-timeout 1s >/dev/null 2>&1; then
+if APC_FAKE_HANG_SW_VERS=1 APC_FAKE_CHILD_MARKER="$child_marker" run_harness --role server --cluster lan-spike --output "$timeout_output" --check-timeout 1s >/dev/null 2>&1; then
   printf '%s\n' 'watchdog accepted a hanging required check' >&2
   exit 1
 fi
@@ -220,5 +236,10 @@ fi
 grep -q $'^FAIL\tos-version\ttimed out after 1s;' "$timeout_output/results.tsv"
 grep -q $'^PASS\tplatform\t' "$timeout_output/results.tsv"
 grep -q '^status=complete$' "$timeout_output/sanitization.txt"
+sleep 3
+if [[ -e "$child_marker" ]]; then
+  printf '%s\n' 'watchdog left a descendant process alive after timeout' >&2
+  exit 1
+fi
 
 printf '%s\n' 'hardware acceptance harness tests passed'

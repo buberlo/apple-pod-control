@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -22,6 +23,11 @@ const (
 	Pass Status = "PASS"
 	Warn Status = "WARN"
 	Fail Status = "FAIL"
+)
+
+var (
+	defaultRouteInterfacePattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9]{0,15}$`)
+	tunnelInterfacePattern       = regexp.MustCompile(`^utun[0-9]+$`)
 )
 
 type Result struct {
@@ -198,6 +204,7 @@ func run(ctx context.Context, env environment, options Options) Report {
 	}
 	if env.goos == "darwin" && env.goarch == "arm64" {
 		add("platform", Pass, "darwin/arm64", "")
+		checkDefaultRoute(ctx, env, options.Timeout, add)
 	} else {
 		add("platform", Fail, env.goos+"/"+env.goarch, "APC K3s nodes require Apple Silicon macOS")
 	}
@@ -258,7 +265,7 @@ func run(ctx context.Context, env environment, options Options) Report {
 	if machineHelpErr != nil {
 		add("container-machine", Warn, "machine API unavailable", "the run-based node envelope remains usable")
 	} else if !strings.Contains(machineHelp, "--publish") {
-		add("container-machine", Warn, "no host port publishing in container 1.0", "the K3s spike uses container run")
+		add("container-machine", Warn, "no host port publishing in container 1.0", "APC creates K3s nodes with container run")
 	} else {
 		add("container-machine", Pass, "host port publishing supported", "")
 	}
@@ -318,6 +325,62 @@ func run(ctx context.Context, env environment, options Options) Report {
 	}
 
 	return report
+}
+
+func checkDefaultRoute(ctx context.Context, env environment, timeout time.Duration, add func(string, Status, string, string)) {
+	output, err := runWithTimeout(ctx, env, timeout, "/sbin/route", "-n", "get", "default")
+	if err != nil {
+		add(
+			"host-default-route",
+			Warn,
+			"default route lookup unavailable",
+			"verify host routing and Apple vmnet NAT before relying on VM/pod egress",
+		)
+		return
+	}
+
+	interfaceName, ok := parseDefaultRouteInterface(output)
+	if !ok {
+		add(
+			"host-default-route",
+			Warn,
+			"default route interface could not be determined",
+			"verify host routing and Apple vmnet NAT before relying on VM/pod egress",
+		)
+		return
+	}
+
+	if tunnelInterfacePattern.MatchString(interfaceName) {
+		add(
+			"host-default-route",
+			Warn,
+			fmt.Sprintf("default route uses tunnel interface %s; VM/pod egress may be affected", interfaceName),
+			"verify the tunnel permits Apple vmnet NAT traffic",
+		)
+		return
+	}
+
+	add("host-default-route", Pass, fmt.Sprintf("default route uses non-tunnel interface %s", interfaceName), "")
+}
+
+func parseDefaultRouteInterface(output string) (string, bool) {
+	interfaceName := ""
+	for _, line := range strings.Split(output, "\n") {
+		key, value, found := strings.Cut(strings.TrimSpace(line), ":")
+		if !found || !strings.EqualFold(strings.TrimSpace(key), "interface") {
+			continue
+		}
+
+		candidate := strings.TrimSpace(value)
+		if !defaultRouteInterfacePattern.MatchString(candidate) {
+			return "", false
+		}
+		if interfaceName != "" && interfaceName != candidate {
+			return "", false
+		}
+		interfaceName = candidate
+	}
+	return interfaceName, interfaceName != ""
 }
 
 type listedContainer struct {

@@ -1,184 +1,93 @@
 # Apple Pod Control
 
-Apple Pod Control (APC) is a lightweight, Kubernetes-inspired orchestrator for
-[`apple/container` 1.0](https://github.com/apple/container). A small Go control
-plane schedules isolated ARM64 Linux micro-VM workloads across Apple Silicon
-Macs; a local agent drives Apple's native `container` CLI.
+Apple Pod Control (APC) runs **real Kubernetes with K3s** in lightweight,
+native ARM64 virtual machines created by
+[`apple/container` 1.0](https://github.com/apple/container). APC is the
+Apple-host and cluster-lifecycle layer: it creates node VMs, preserves their
+data, manages kubeconfigs, moves images, diagnoses the outer VM network and
+provides safe backup, recovery and macOS supervision.
 
-APC v2 is now being developed on a separate path that runs a real K3s control
-plane inside an Apple container VM. This makes native `kubectl` and Helm
-available without emulating more Kubernetes APIs. The tested design decision is
-recorded in [ADR 0001](docs/adr/0001-k3s-control-plane.md), and the isolated
-[K3s spike quickstart](docs/k3s-spike.md) does not disturb an APC v1 cluster.
-The [two-Mac validation report](docs/k3s-spike-results.md) records what passed
-and the Apple runtime networking issue found during restart testing.
+K3s—not APC—owns the Kubernetes API, desired state, controllers, scheduler,
+Pods, Deployments, Services, Secrets, Jobs, storage and embedded etcd. Workload
+commands are passed to native `kubectl`; `apc helm` passes through to native
+Helm. This keeps the Kubernetes behavior and ecosystem people already know.
 
-APC can also run a local three-server K3s/embedded-etcd lab in three native
-ARM64 Apple micro-VMs. It tolerates one server-VM failure while remaining one
-physical Mac failure domain. A supervised local TLS-pass-through proxy gives
-clients a stable loopback API endpoint while retaining direct-member fallback.
-APC persists HA operator intent separately from observed VM state: the whole
-cluster is either desired `Running` or `Stopped`, and a running cluster may
-have at most one intentionally stopped member. The supervisor honors that
-intent across process restarts instead of undoing maintenance operations.
-See the [local K3s HA guide](docs/k3s-ha.md).
+> Project status: development and trusted-LAN lab. The implementation has
+> substantial live Apple-Silicon validation, but it is not production-ready.
+> Read [current limitations](#current-limitations) before relying on it.
 
-This repository is an MVP: it is useful for development and trusted LAN labs,
-but it is not a production replacement for Kubernetes. The architecture and
-failure behavior are documented in [docs/architecture.md](docs/architecture.md).
-
-## What is included
-
-- Kubernetes-shaped Deployment YAML with namespaces, labels/selectors,
-  single-container Pod templates, resource requests/limits and probes
-- REST API plus SQLite/WAL desired-state store
-- level-triggered Deployment controller, self-healing and rolling updates
-- resource-aware scheduler for connected Apple Silicon nodes
-- long-lived bidirectional gRPC agent channel with heartbeat/status reporting
-- `apple/container run --detach --arch arm64` execution and JSON inspection
-- `apc`, a kubectl-like CLI:
+## Architecture
 
 ```text
-apc apply -f examples/deployment.yaml
-apc get deployments
-apc get pods -o wide
-apc get nodes
-apc describe deployment web
-apc scale deployment web --replicas=3
-apc rollout status deployment/web --timeout=2m
-apc delete deployment web
+ apc apply/get/logs/exec ─┐
+ native kubectl ──────────┼── protected kubeconfig ──> K3s API
+ apc helm / native Helm ──┘                              │
+                                                        │ Kubernetes owns
+                         ┌──────────────────────────────┤ workloads and state
+                         v                              v
+                Apple VM: K3s server           Apple VM: K3s agent
+                persistent Apple volume        persistent Apple volume
+                         └──── Flannel VXLAN / kubelet ──┘
+                   Mac A                              Mac B
+
+ APC owns: apple/container VM and volume lifecycle, cluster contexts,
+ image transport, diagnostics, PF/overlay integration, supervision and recovery.
 ```
 
-Those commands target the APC v1 API when no APC v2 context exists or when
-`--legacy` is used. With an active K3s cluster, APC v2 forwards Kubernetes
-workload commands to native `kubectl` with full streaming and flag support:
+A Kubernetes Pod runs inside K3s on a node VM. APC does **not** create one
+Apple VM per Pod. K3s may run many Pods in each native ARM64 node VM.
 
-```text
-apc config use-cluster lan-spike
-apc get pods -A -o wide
-apc apply -f examples/kubernetes/web.yaml
-apc logs -f deployment/web
-apc exec -it deployment/web -- /bin/sh
-apc rollout status deployment/web
-apc port-forward service/web 8081:80
-apc cluster doctor
-apc image sync docker.io/library/busybox:1.36.1 --peer user@mac-mini.local
-apc cluster backup lan-spike --output "$HOME/Backups/lan-spike.apcbackup"
-apc system install --role server --cluster lan-spike
-apc cluster network-policy enable lan-spike --yes
-apc cluster ha create ha-lab
-apc cluster ha status ha-lab
-apc system install --role ha --cluster ha-lab \
-  --executable "$HOME/.local/bin/apc"
-apc --cluster ha-lab get nodes -o wide
-apc helm --cluster ha-lab upgrade --install web examples/helm/web --wait
-apc --cluster ha-lab image prefetch docker.io/library/busybox:1.36.1
-apc cluster doctor ha-lab --skip-egress
-apc cluster ha member restart 2 ha-lab --yes
-apc cluster ha snapshot ha-lab --output "$HOME/Backups/ha-lab-snapshot"
-```
+Supported development topologies:
 
-APC owns cluster lifecycle and context selection. Kubernetes continues to own
-its API and command semantics. `apc helm` invokes native Helm with the selected
-protected kubeconfig, while direct Helm remains supported. See the
-[APC v2 CLI contract](docs/cli-v2.md).
+- one K3s server VM on one Apple Silicon Mac;
+- one server Mac plus one K3s agent Mac on a trusted LAN;
+- three K3s/embedded-etcd server VMs on one Mac for quorum and recovery labs.
 
-`apc cluster doctor` goes beyond Kubernetes `Ready`: it creates an isolated,
-short-lived probe Pod on every Ready node and checks host API reachability,
-kubelet exec, DNS, HTTPS egress, ClusterIP and directed cross-node HTTP. The
-uniquely named probe Pods and Service are deleted automatically.
+The three-VM topology tolerates one **VM** failure, but all members still share
+one physical Mac and therefore one physical failure domain.
 
-`apc image prefetch` imports host-pulled ARM64 images into the local nested K3s
-containerd. `apc image sync` additionally streams the private OCI archive over
-key-only SSH into remote APC agents, allowing deterministic scheduling even
-when an Apple VM cannot reach a public registry. For a protected HA cluster,
-prefetch validates and imports the image into all three server stores before it
-reports success.
+## Kubernetes-native CLI
 
-Cluster lifecycle includes ownership-checked delete/remove, consistent offline
-volume backups, checksum-validated restore, digest-only upgrades with automatic
-rollback, and per-user launchd supervision. Destructive operations require an
-explicit `--yes`; `--keep-data` removes only the disposable VM envelope.
-
-HA uses separate native-etcd snapshot and restore commands. Snapshot packages
-include the matching K3s server token and must be protected as credentials.
-Restore is an in-place rollback for the same saved cluster: it requires the
-current matching token, saved configuration, exact network and all three member
-volumes. It is not replacement-host disaster recovery. Snapshot, restore and
-single-member lifecycle operations are serialized across independent APC
-processes by a private per-cluster lock. Quorum-reducing member mutations and
-snapshots also validate the real local embedded-etcd health and peer topology;
-Kubernetes API or Node readiness alone is not accepted as quorum proof.
-
-Without intentional stop state, the HA supervisor repairs at most one unhealthy
-member at a time. A running-but-unhealthy member is restarted only after the
-other two embedded-etcd voters prove a healthy, mutually consistent majority;
-failed repairs use bounded exponential backoff. A nonterminal, unsuccessful or
-untrusted restore journal blocks automatic VM mutation until recovery is safely
-completed or retried. The independently supervised API proxy continues running
-while reconciliation is blocked.
-
-The final live HA gate on 2026-07-20 ran three native ARM64 K3s/embedded-etcd
-VMs on one Mac at 3/3 Ready. Its Helm nginx release had one Ready Pod per VM and
-an intact PodDisruptionBudget. One intentionally stopped member remained down
-for more than two supervisor ticks while the two-voter quorum accepted and read
-back a write; starting that member again returned the cluster to 3/3. A fresh
-snapshot and restore reverted a changed ConfigMap and removed an object created
-only after the snapshot, while preserving the Helm release. The final deep
-doctor reported 34 passes, three expected public-egress-skip warnings and zero
-failures.
-
-The validated snapshot package used a private `0700` directory, an immutable
-`0400` manifest and `0600` snapshot/token artifacts. The live snapshot also
-exposed that apple/container automatically attaches a default network to a
-recovery helper; APC now requests `default,mtu=1280` explicitly and requires
-that exact identity during ownership checks. Replacement-host and token-loss
-recovery remain unsupported, as does physical-host HA without three Macs.
-
-New v2 clusters enable K3s NetworkPolicy enforcement by default. APC preserves
-each node's Kubernetes `InternalIP` across disposable Apple-VM replacement, and
-the policy controller has been exercised across consecutive server and agent
-restarts. The example Helm chart includes a same-namespace ingress policy,
-rolling updates, topology spread and an optional PodDisruptionBudget.
-
-For a two-Mac cluster, APC can validate, load and persist exact-peer macOS PF
-rules for the Kubernetes API, kubelet and Flannel VXLAN ports. Installation
-copies a root-owned helper and creates a root LaunchDaemon; it requires an
-interactive administrator authorization on each Mac:
+There is one binary: `apc`. Cluster lifecycle commands are APC-specific;
+workload commands retain native kubectl semantics and streaming behavior.
 
 ```bash
-apc system firewall render --cluster lan-spike --role server \
-  --interface en0 --local-ip SERVER_IP --peer AGENT_IP
-sudo apc system firewall install --cluster lan-spike --role server \
-  --interface en0 --local-ip SERVER_IP --peer AGENT_IP --yes
+apc cluster create dev
+apc config use-cluster dev
+
+apc get nodes -o wide
+apc get pods -A
+apc apply --server-side -f examples/kubernetes/web.yaml
+apc rollout status deployment/web
+apc logs -f deployment/web
+apc exec -it deployment/web -- /bin/sh
+apc port-forward service/web 18080:80
+
+apc helm upgrade --install web examples/helm/web --wait
 ```
 
-VXLAN is not encrypted. Use only a trusted LAN, or bind the cluster and PF rules
-to an authenticated host-overlay interface. Apple container 1.0's guest kernel
-does not support WireGuard-native Flannel.
+`--cluster NAME`, then `APC_CLUSTER`, then the persisted current cluster decide
+which protected kubeconfig is used. If no cluster is selected, workload
+commands fail with guidance instead of contacting an implicit API endpoint.
 
-`apc system overlay check --peer-ip PEER_TAILSCALE_IP` validates an independently
-authenticated Tailscale host path without accepting an auth key. PF supports
-`--interface auto`, so its reboot reconciler can resolve macOS's current `utun`
-name from the stable local overlay IP.
+See the complete [CLI contract](docs/cli.md).
 
-As of 2026-07-20, PF install and privileged status checks pass on both test
-Macs. Reboot persistence and rejection of an unlisted peer have not yet been
-demonstrated, and the overlay gate remains open. Tailscale is absent on both
-machines; installation, macOS network approval and interactive account
-authentication require the user.
+## Prerequisites
 
-## Requirements
+- Apple Silicon Mac;
+- macOS 26;
+- [`apple/container` 1.0](https://github.com/apple/container/releases/tag/1.0.0);
+- Go 1.25 or newer to build APC;
+- native `kubectl` and Helm for the full CLI experience.
 
-- Control plane/CLI: Go 1.25 or newer
-- Runtime nodes: Apple Silicon, macOS 26, `apple/container` 1.0
-- Start Apple's service once on every node: `container system start`
+Start Apple's service and install the Kubernetes clients:
 
-Apple's runtime is optimized for Apple Silicon and runs each OCI container in
-its own lightweight VM. APC uses the CLI contract from the 1.0 release:
-`container run`, `stop`, `delete`, `exec`, and machine-readable `inspect` JSON.
+```bash
+container system start
+brew install kubernetes-cli helm
+```
 
-## Build and test
+## Build and install
 
 ```bash
 make test
@@ -186,131 +95,174 @@ make build
 make install
 ```
 
-Binaries are written to `bin/apc`, `bin/apc-server`, and `bin/apc-agent`.
-`make install` copies them to `~/.local/bin` by default; override this with
-`PREFIX=/usr/local make install` when a system-wide installation is desired.
-Ensure `~/.local/bin` is present in your shell's `PATH`.
-
-## APC v2 K3s spike
-
-Check the Mac and create a local Kubernetes node on the isolated development
-port `16443`:
+The build writes `bin/apc`. By default, installation copies it to
+`~/.local/bin/apc`; use `PREFIX=/usr/local make install` for a system-wide
+installation. Ensure the chosen directory is on `PATH`, then verify:
 
 ```bash
-bin/apc doctor
-bin/apc cluster create spike
-export KUBECONFIG="$(bin/apc kubeconfig path spike)"
-
-bin/apc get nodes
-bin/apc get pods -A
-bin/apc helm upgrade --install web examples/helm/web --wait
-bin/apc port-forward service/web-apc-web 18081:80
+command -v apc
+apc version
+apc doctor
 ```
 
-The K3s version and multi-platform OCI image digest are pinned in code. The
-node runs ARM64 natively and uses VXLAN because Apple container 1.0's guest
-kernel does not provide a WireGuard interface. Kubernetes state lives on an
-APC-labelled Apple volume; `apc cluster start` recreates the lightweight VM
-envelope, reattaches that volume and retains a stable Kubernetes `InternalIP`.
+## Quickstart: nginx from a Kubernetes manifest
 
-## Local development smoke test
-
-Run the control plane:
+Create a local, single-server cluster. APC pins the K3s image by OCI digest,
+runs it as Linux/ARM64 and enables K3s NetworkPolicy enforcement by default.
 
 ```bash
-bin/apc-server --database .apc/dev.db
+apc cluster create dev
+apc cluster status dev
+apc apply -f examples/kubernetes/web.yaml
+apc rollout status deployment/web --timeout=2m
+apc get deployment,pod,service -o wide
 ```
 
-Run one or more fake agents (no `apple/container` installation required):
+The example is ordinary Kubernetes YAML: a Deployment, ClusterIP Service,
+NetworkPolicy and PodDisruptionBudget using the multi-architecture nginx image.
+Reach it without permanently publishing a workload port:
 
 ```bash
-bin/apc-agent --fake-runtime --node-id macbook --label apc.dev/architecture=arm64
-bin/apc-agent --fake-runtime --node-id mac-mini --label apc.dev/architecture=arm64
+apc port-forward service/web 18080:80
+curl http://127.0.0.1:18080/
 ```
 
-Apply and inspect:
+Delete only the workload when finished:
 
 ```bash
-bin/apc apply -f examples/deployment.yaml
-bin/apc get deployments
-bin/apc get pods -o wide
-bin/apc rollout status deployment/web --timeout=30s
+apc delete -f examples/kubernetes/web.yaml
 ```
 
-The example requests two replicas with static host port 18080. Since host ports
-are exclusive per node, the scheduler intentionally places one replica on each
-of two Macs. With one node, the second Pod remains `Pending` and explains why
-in `apc describe deployment web`.
+## Quickstart: nginx with Helm
 
-## Hardware validation
-
-The end-to-end path has been exercised with `apple/container` 1.0.0 on an
-Apple M3 Pro MacBook and an Apple M2 Mac mini. The test covered native ARM64 VM
-startup, one replica per node, HTTP readiness/liveness, a rolling update,
-scale-up/down without replacing existing Pods, control-plane restart and agent
-re-adoption, and deletion of both VMs. No host-specific addresses or
-credentials are required by the repository.
-
-The two-Mac K3s cluster also passed the deep doctor with public egress skipped:
-16 passes, two intentional egress warnings and zero failures. Public HTTPS from
-the MacBook Apple VM remains a known failure; the Mac mini VM passes that gate.
-The local HA lab has live-proven a Helm deployment with three Ready replicas,
-one on each of its three VMs. That remains one physical fault domain.
-
-The manual [two-Mac hardware workflow](.github/workflows/hardware-acceptance.yml)
-runs only from the default branch and performs read-only/status checks unless
-the operator separately enables mutation and the deep doctor. It never checks
-out pull-request code on the self-hosted Macs and uploads redacted diagnostics.
-The worker gate does not require the control-plane-only `kubectl` and Helm
-clients.
-The dedicated MacBook and Mac mini runner labels are defined, but the runners
-have not been registered with GitHub, so this workflow has not yet run there.
-
-Apple container 1.0 does not bind its dynamic primary IPv4 allocation to the
-MAC requested by `container run`. APC therefore detects collisions with member
-stable addresses before K3s or restore mutation, removes only the exact
-APC-owned conflicting envelope and retries under fixed bounds. Exact envelopes
-from the immediately preceding launch format are migrated one member at a time;
-foreign or otherwise mismatched envelopes are refused.
-
-## Two-Mac LAN setup
-
-On the machine running the control plane, bind addresses already default to all
-interfaces. For a first trusted-LAN test:
+The included chart is a standard Helm chart. APC only supplies and validates
+the selected kubeconfig before invoking Helm.
 
 ```bash
-APC_TOKEN='replace-me' bin/apc-server \
-  --http-address 0.0.0.0:8080 \
-  --grpc-address 0.0.0.0:9090
+helm lint examples/helm/web
+apc helm upgrade --install web examples/helm/web \
+  --namespace web --create-namespace --wait --timeout 2m
+apc get deployment,pod,service -n web -o wide
+apc helm uninstall web -n web
 ```
 
-On each Apple Silicon node:
+Direct Helm is equally supported:
 
 ```bash
-container system start
-bin/apc-agent \
-  --server CONTROL_PLANE_LAN_IP:9090 \
-  --node-id UNIQUE_NODE_NAME \
-  --advertise-address NODE_LAN_IP \
-  --label apc.dev/architecture=arm64
+export KUBECONFIG="$(apc kubeconfig path dev)"
+helm list --all-namespaces
 ```
 
-Point the CLI at the control plane:
+## Cluster and node operations
 
 ```bash
-APC_SERVER=http://CONTROL_PLANE_LAN_IP:8080 \
-APC_TOKEN=replace-me \
-bin/apc get nodes
+apc cluster status dev
+apc cluster doctor dev --skip-egress
+apc cluster stop dev
+apc cluster start dev
+
+apc cluster backup dev --output "$HOME/Backups/dev.apcbackup"
+apc cluster restore dev --from "$HOME/Backups/dev.apcbackup" --yes
+apc cluster upgrade dev --image docker.io/rancher/k3s@sha256:DIGEST --yes
+
+apc cluster write-join-token dev --output PRIVATE_TOKEN_FILE
+apc node join dev --server-url https://SERVER_ADDRESS:16443 \
+  --token-file PRIVATE_TOKEN_FILE --advertise-address AGENT_ADDRESS
 ```
 
-Plaintext gRPC is only for the first trusted-LAN test. Use the TLS/mTLS flags
-described in the architecture document for an ongoing deployment.
+APC checks exact ownership labels before destructive operations. Named Apple
+volumes retain `/var/lib/rancher/k3s` while disposable VM envelopes are
+replaced. Backups are checksum-validated, upgrades require immutable image
+digests, and destructive operations require `--yes`.
 
-## Deployment data model
+`apc cluster doctor` goes beyond Kubernetes Node `Ready`: it creates
+short-lived, node-pinned probe Pods and verifies runtime/API state, kubelet
+exec, DNS, optional public HTTPS, ClusterIP and every directed cross-node HTTP
+path. Its exact probe resources are cleaned automatically.
 
-See [examples/deployment.yaml](examples/deployment.yaml). Its structure follows
-the Kubernetes Deployment model while APC validates exactly one container per
-Pod because `apple/container` maps each container to one micro-VM.
+## Images on Apple Silicon
+
+APC selects native `linux/arm64` images and can import them from the macOS host
+store into nested K3s containerd:
+
+```bash
+apc image prefetch docker.io/library/busybox:1.36.1
+apc image sync docker.io/library/busybox:1.36.1 --peer ACCOUNT@PEER_HOST
+```
+
+For a protected three-member HA cluster, prefetch validates and imports the
+same exact image into all three member stores. This avoids x86 translation and
+can make workloads independent of guest-VM registry egress.
+
+## Local three-VM HA lab
+
+```bash
+apc cluster ha create ha-lab
+apc cluster ha status ha-lab
+apc --cluster ha-lab get nodes -o wide
+apc helm --cluster ha-lab upgrade --install web examples/helm/web \
+  --set replicaCount=3 --set podDisruptionBudget.enabled=true --wait
+```
+
+The HA mode uses three K3s servers with embedded etcd, distinct persistent
+volumes, an APC-owned Apple network and a supervised loopback TLS-pass-through
+API endpoint. Member operations, snapshots, restore and recovery are serialized
+and quorum-gated. See the [HA operations guide](docs/k3s-ha.md).
+
+Same-Mac empty-host recovery has passed, including a negative digest test that
+caused no mutation. A replacement-Mac drill validated the package, independent
+manifest digest and seed etcd reset, but the other members could not reach the
+stored stable address through the target host's newer `apple/container` vmnet.
+APC failed closed and the disposable drill resources were cleaned. Off-host
+recovery is therefore **not supported yet**.
+
+## macOS networking and supervision
+
+For cross-host labs APC can render and install peer-restricted PF rules for the
+K3s API, kubelet and Flannel VXLAN ports. VXLAN is not encrypted; use only a
+trusted LAN or bind the cluster consistently to an authenticated host overlay.
+APC can validate an existing Tailscale identity and route, but it never accepts
+an overlay authentication key.
+
+APC supports a per-user LaunchAgent and a hardened root-owned LaunchDaemon that
+drops to a selected non-root account. The unattended service uses an exact
+`launchctl asuser`/`sudo -n`/`env -i` chain, protected bounded logs and strict
+status/ownership validation.
+
+## Current limitations
+
+- The project remains a development/trusted-LAN lab, not a production
+  Kubernetes distribution.
+- Three local etcd VMs are one physical failure domain; physical HA needs three
+  independent Macs.
+- Replacement-Mac/off-host HA recovery is blocked by non-portable stable-IP
+  routing across tested `apple/container` vmnet versions.
+- The saved two-Mac worker is currently stopped because DHCP changed the host
+  addresses stored as the K3s server URL and advertise addresses. Reserve
+  stable LAN addresses or use a stable authenticated overlay before rejoining.
+- Public HTTPS from Apple VMs is not reliable on every tested host. Host-side
+  image prefetch is a mitigation, not a general NAT fix.
+- PF persistence passed a headless reboot on the Mac mini; the corresponding
+  MacBook reboot, an unlisted-peer rejection and uninstall rollback remain
+  open.
+- Hardware runners currently use administrator accounts as a lab deviation;
+  dedicated unprivileged accounts are still required.
+- APC's unattended service has deterministic security tests, but its repeated
+  zero-login live reboot gate remains open.
+
+The authoritative gate list is [release readiness](docs/release-readiness.md),
+and dated evidence is in [validation results](docs/validation-results.md).
+
+## Documentation
+
+- [Architecture and trust boundaries](docs/architecture.md)
+- [Quickstart and two-Mac setup](docs/quickstart.md)
+- [CLI contract](docs/cli.md)
+- [Local K3s HA operations](docs/k3s-ha.md)
+- [Live validation results](docs/validation-results.md)
+- [Hardware runner trust model](docs/hardware-runners.md)
+- [Release-readiness gates](docs/release-readiness.md)
+- [ADR 0001: K3s is APC's control plane](docs/adr/0001-k3s-control-plane.md)
 
 ## License
 

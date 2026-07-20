@@ -237,13 +237,19 @@ run_with_watchdog() {
   local timeout=$1
   local log_file=$2
   shift 2
-  local seconds command_pid watchdog_pid status=0 attempt
+  local seconds command_pid command_pgid watchdog_pid status=0 attempt
   local timeout_marker="$log_file.timeout"
   seconds=$(duration_seconds "$timeout") || return 70
   rm -f -- "$timeout_marker"
 
+  # A timed-out kubectl/apc process can have container/runtime children. Run
+  # every check as its own job-control process group so TERM/KILL reaches the
+  # complete tree before artifacts are sanitized and uploaded.
+  set -m
   "$@" >"$log_file" 2>&1 &
   command_pid=$!
+  command_pgid=$command_pid
+  set +m
   (
     local watchdog_sleep_pid=""
     trap '
@@ -257,24 +263,43 @@ run_with_watchdog() {
     watchdog_sleep_pid=$!
     wait "$watchdog_sleep_pid" || exit 0
     watchdog_sleep_pid=""
-    if kill -0 "$command_pid" 2>/dev/null; then
+    if kill -0 -- "-$command_pgid" 2>/dev/null; then
       : >"$timeout_marker"
-      kill -TERM "$command_pid" 2>/dev/null || true
+      kill -TERM -- "-$command_pgid" 2>/dev/null || true
       for attempt in {1..20}; do
-        kill -0 "$command_pid" 2>/dev/null || exit 0
+        kill -0 -- "-$command_pgid" 2>/dev/null || exit 0
         sleep 0.1
       done
-      kill -KILL "$command_pid" 2>/dev/null || true
+      kill -KILL -- "-$command_pgid" 2>/dev/null || true
+      for attempt in {1..20}; do
+        kill -0 -- "-$command_pgid" 2>/dev/null || exit 0
+        sleep 0.1
+      done
     fi
   ) &
   watchdog_pid=$!
 
   wait "$command_pid" || status=$?
-  kill "$watchdog_pid" 2>/dev/null || true
-  wait "$watchdog_pid" 2>/dev/null || true
   if [[ -f "$timeout_marker" ]]; then
+    # The leader can exit on TERM before a child does. Let the watchdog finish
+    # its group-wide escalation before returning to the sanitizer.
+    wait "$watchdog_pid" 2>/dev/null || true
     printf 'check exceeded portable watchdog timeout %s\n' "$timeout" >>"$log_file"
     return 124
+  fi
+  kill "$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
+  # A command that exits after daemonizing a child is also fully reaped. Checks
+  # are not allowed to leave background work mutating the host or artifacts.
+  if kill -0 -- "-$command_pgid" 2>/dev/null; then
+    kill -TERM -- "-$command_pgid" 2>/dev/null || true
+    for attempt in {1..20}; do
+      kill -0 -- "-$command_pgid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 -- "-$command_pgid" 2>/dev/null; then
+      kill -KILL -- "-$command_pgid" 2>/dev/null || true
+    fi
   fi
   return "$status"
 }
@@ -429,10 +454,8 @@ if [[ "$role" == "server" && -n "$helm_bin" ]]; then
 fi
 
 if [[ -n "$apc_bin" ]]; then
-  run_check required apc-help env -u APC_TOKEN "$apc_bin" --help || true
-  # `apc version` also contacts the v1 API server, so it is useful evidence but
-  # is not a v2 hardware-gate prerequisite on an agent-only Mac.
-  run_check optional apc-version "$apc_bin" version || true
+  run_check required apc-help "$apc_bin" --help || true
+  run_check required apc-version "$apc_bin" version || true
   run_check required host-doctor "$apc_bin" doctor --role "$role" || true
   run_check required supervisor-status "$apc_bin" --cluster "$cluster" system status --role "$role" || true
   run_check optional firewall-status firewall_status_check || true

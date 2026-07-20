@@ -359,7 +359,7 @@ func (m *Manager) Diagnose(ctx context.Context, name string, options DiagnoseOpt
 			add("egress/"+pod.Node, DiagnosticWarn, "skipped by request", "")
 		} else if probeErr := m.podProbe(diagnosticCtx, name, options.ProbeTimeout, report.Namespace, pod.Name,
 			"wget", "-q", "-T", strconv.Itoa(max(1, int(options.ProbeTimeout.Seconds())-1)), "-O", "/dev/null", "https://example.com/"); probeErr != nil {
-			add("egress/"+pod.Node, DiagnosticFail, conciseError(probeErr), "verify Apple VM NAT, DNS and host routing")
+			add("egress/"+pod.Node, DiagnosticFail, conciseError(probeErr), "verify Apple VM NAT, DNS and host routing; host tunnel default routes may block forwarded VM traffic")
 		} else {
 			add("egress/"+pod.Node, DiagnosticPass, "HTTPS egress succeeded", "")
 		}
