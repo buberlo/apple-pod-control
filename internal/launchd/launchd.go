@@ -45,11 +45,15 @@ type Manager struct {
 	euid                   int
 	home                   string
 	launchDaemonsDirectory string
-	lookupAccount          accountLookup
-	lookupGroup            groupLookup
-	chown                  fileChown
-	ownership              ownershipLookup
-	directoryOpenedHook    func(string)
+	// launchDaemonsValidationRoot is always "/" in production. Tests may set
+	// a narrower private sandbox root so validation does not depend on the
+	// operating system's shared temporary-directory ancestors.
+	launchDaemonsValidationRoot string
+	lookupAccount               accountLookup
+	lookupGroup                 groupLookup
+	chown                       fileChown
+	ownership                   ownershipLookup
+	directoryOpenedHook         func(string)
 }
 
 func NewManager() (*Manager, error) {
@@ -59,8 +63,9 @@ func NewManager() (*Manager, error) {
 	}
 	return &Manager{
 		runner: execRunner{}, uid: os.Getuid(), euid: os.Geteuid(), home: home,
-		launchDaemonsDirectory: "/Library/LaunchDaemons",
-		lookupAccount:          defaultAccountLookup, lookupGroup: defaultGroupLookup,
+		launchDaemonsDirectory:      "/Library/LaunchDaemons",
+		launchDaemonsValidationRoot: string(filepath.Separator),
+		lookupAccount:               defaultAccountLookup, lookupGroup: defaultGroupLookup,
 		chown: defaultFileChown, ownership: defaultOwnershipLookup,
 	}, nil
 }

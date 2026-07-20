@@ -280,7 +280,25 @@ func (m *Manager) validateLaunchDaemonsDirectory() error {
 	if !filepath.IsAbs(directory) || directory == string(filepath.Separator) || directory != m.launchDaemonsDirectory || strings.ContainsAny(directory, "\r\n") {
 		return fmt.Errorf("LaunchDaemons directory must be an explicit absolute path")
 	}
-	for _, ancestor := range absoluteDirectoryChain(directory) {
+	validationRoot := filepath.Clean(m.launchDaemonsValidationRoot)
+	if m.launchDaemonsValidationRoot == "" {
+		validationRoot = string(filepath.Separator)
+	}
+	if !filepath.IsAbs(validationRoot) || strings.ContainsAny(validationRoot, "\r\n") {
+		return fmt.Errorf("LaunchDaemons validation root must be an explicit absolute path")
+	}
+	relative, err := filepath.Rel(validationRoot, directory)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("LaunchDaemons directory must remain beneath its protected validation root")
+	}
+	chain := absoluteDirectoryChain(directory)
+	for len(chain) > 0 && chain[0] != validationRoot {
+		chain = chain[1:]
+	}
+	if len(chain) == 0 {
+		return fmt.Errorf("LaunchDaemons validation root is not an ancestor of its directory")
+	}
+	for _, ancestor := range chain {
 		info, err := inspectPathNoFollow(ancestor)
 		if err != nil {
 			return fmt.Errorf("inspect LaunchDaemons directory chain at %s: %w", ancestor, err)

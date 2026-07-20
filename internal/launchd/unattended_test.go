@@ -891,6 +891,15 @@ func TestUnattendedCleanSystemOnlyModePassesConflictGate(t *testing.T) {
 	}
 }
 
+func TestUnattendedValidationRootMustContainLaunchDaemonsDirectory(t *testing.T) {
+	fixture := newUnattendedFixture(t)
+	fixture.manager.launchDaemonsValidationRoot = fixture.home
+
+	if _, err := fixture.manager.unattendedPlan(fixture.config, fixture.username); err == nil || !strings.Contains(err.Error(), "beneath its protected validation root") {
+		t.Fatalf("validation-root escape error = %v", err)
+	}
+}
+
 func newUnattendedFixture(t *testing.T) *unattendedFixture {
 	t.Helper()
 	root, err := filepath.EvalSymlinks(t.TempDir())
@@ -921,7 +930,8 @@ func newUnattendedFixture(t *testing.T) *unattendedFixture {
 	owners[filepath.Clean(home)] = testOwnership{uid: 501, gid: 20}
 	runner := &systemRunner{}
 	manager := &Manager{
-		runner: runner, uid: 501, euid: 0, home: home, launchDaemonsDirectory: daemonDirectory,
+		runner: runner, uid: 501, euid: 0, home: home,
+		launchDaemonsDirectory: daemonDirectory, launchDaemonsValidationRoot: root,
 		lookupAccount: func(username string) (accountRecord, error) {
 			if username != "worker" {
 				return accountRecord{}, errors.New("account not found")
