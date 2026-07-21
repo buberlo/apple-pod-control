@@ -20,6 +20,7 @@ type haMemberLifecycleRunner struct {
 	ready                 map[int]bool
 	legacy                map[int]bool
 	readyAfterRun         bool
+	expireOnProbeAfterRun func()
 	foreignMember         int
 	failInspectAfterStop  bool
 	postStopInspectFailed bool
@@ -28,6 +29,34 @@ type haMemberLifecycleRunner struct {
 	etcdProbes            map[int]int
 	calls                 [][]string
 	mutations             []string
+}
+
+// manualDeadlineContext lets lifecycle tests expire an operation at an exact
+// reconciliation phase without relying on scheduler-sensitive wall-clock sleeps.
+type manualDeadlineContext struct {
+	context.Context
+	done chan struct{}
+}
+
+func newManualDeadlineContext() *manualDeadlineContext {
+	return &manualDeadlineContext{Context: context.Background(), done: make(chan struct{})}
+}
+
+func (ctx *manualDeadlineContext) Done() <-chan struct{} {
+	return ctx.done
+}
+
+func (ctx *manualDeadlineContext) Err() error {
+	select {
+	case <-ctx.done:
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
+
+func (ctx *manualDeadlineContext) expire() {
+	close(ctx.done)
 }
 
 func newHAMemberLifecycleFixture(t *testing.T) (*Manager, *haMemberLifecycleRunner, HAConfig) {
@@ -101,6 +130,11 @@ func (runner *haMemberLifecycleRunner) Run(_ context.Context, _ string, argument
 		}
 		return fakeHAEtcdProbeOutput(member.ID), nil, nil
 	case len(arguments) >= 8 && arguments[0] == "exec" && arguments[2] == "kubectl" && arguments[3] == "get" && arguments[4] == "node":
+		if runner.expireOnProbeAfterRun != nil && len(runner.mutations) > 0 && strings.HasPrefix(runner.mutations[len(runner.mutations)-1], "run:") {
+			expire := runner.expireOnProbeAfterRun
+			runner.expireOnProbeAfterRun = nil
+			expire()
+		}
 		member := memberForHAContainer(runner.t, runner.config, arguments[1])
 		condition := "False"
 		if runner.ready[member.ID] {
@@ -330,10 +364,10 @@ func TestStartHAMemberReturnsBoundedReadinessTimeout(t *testing.T) {
 	runner.states[2] = "stopped"
 	runner.ready[2] = false
 	runner.readyAfterRun = false
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
-	defer cancel()
+	ctx := newManualDeadlineContext()
+	runner.expireOnProbeAfterRun = ctx.expire
 	state, err := manager.StartHAMember(ctx, config.Name, 2, time.Second)
-	if err == nil || !strings.Contains(err.Error(), "reached only 2 of 3") || !strings.Contains(err.Error(), "deadline exceeded") {
+	if err == nil || !strings.Contains(err.Error(), "reached only 2 of 3") || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("state = %+v, error = %v", state, err)
 	}
 	want := []string{"delete:" + target, "run:" + target}
