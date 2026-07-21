@@ -44,3 +44,17 @@ func TestNormalizeRejectsUnsafeOrAmbiguousInputs(t *testing.T) {
 		}
 	}
 }
+
+func TestRenderCanResolveInterfaceFromLocalAddress(t *testing.T) {
+	rules, err := Render(Config{Cluster: "home", Role: "agent", Interface: "auto", LocalIP: "127.0.0.1", Peers: []string{"192.0.2.20"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	name, err := interfaceForIP("127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rules), " on "+name+" ") {
+		t.Fatalf("rules did not use resolved interface %q:\n%s", name, rules)
+	}
+}

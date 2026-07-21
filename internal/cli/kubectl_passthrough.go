@@ -12,9 +12,11 @@ import (
 	"github.com/buberlo/apple-pod-control/internal/cluster"
 )
 
+var errNoSelectedCluster = errors.New("no APC K3s cluster selected; run 'apc config use-cluster NAME' or pass '--cluster NAME'")
+
 var apcCommands = map[string]struct{}{
-	"cluster": {}, "completion": {}, "config": {}, "doctor": {}, "help": {},
-	"image": {}, "kubeconfig": {}, "kubectl": {}, "node": {}, "system": {}, "version": {},
+	"__complete": {}, "__completeNoDesc": {}, "cluster": {}, "completion": {}, "config": {}, "doctor": {}, "help": {},
+	"helm": {}, "image": {}, "kubeconfig": {}, "kubectl": {}, "node": {}, "system": {}, "version": {},
 }
 
 var leadingFlagsWithValues = map[string]struct{}{
@@ -26,28 +28,30 @@ var leadingFlagsWithValues = map[string]struct{}{
 }
 
 type passthroughEnvironment struct {
-	getenv         func(string) string
-	lookPath       func(string) (string, error)
-	currentCluster func() (string, error)
-	kubeconfigPath func(string) (string, error)
-	stat           func(string) (os.FileInfo, error)
-	run            func(context.Context, string, []string, string, io.Reader, io.Writer, io.Writer) error
+	getenv            func(string) string
+	lookPath          func(string) (string, error)
+	currentCluster    func() (string, error)
+	kubeconfigPath    func(string) (string, error)
+	prepareKubeconfig func(context.Context, string) (string, error)
+	stat              func(string) (os.FileInfo, error)
+	run               func(context.Context, string, []string, string, io.Reader, io.Writer, io.Writer) error
 }
 
 // TryKubernetesPassthrough executes kubectl-compatible APC commands against the
-// active APC v2 cluster. It returns handled=false for APC lifecycle commands and
-// when no v2 cluster has been selected, preserving the v1 CLI path.
+// selected APC K3s cluster. It returns handled=false only for APC-owned commands.
 func TryKubernetesPassthrough(ctx context.Context, arguments []string, stdin io.Reader, stdout, stderr io.Writer) (bool, error) {
 	return tryKubernetesPassthrough(ctx, arguments, stdin, stdout, stderr, defaultPassthroughEnvironment())
 }
 
 func defaultPassthroughEnvironment() passthroughEnvironment {
+	manager := cluster.NewManager("container")
 	return passthroughEnvironment{
-		getenv:         os.Getenv,
-		lookPath:       exec.LookPath,
-		currentCluster: cluster.CurrentCluster,
-		kubeconfigPath: cluster.ResolvedKubeconfigPath,
-		stat:           os.Stat,
+		getenv:            os.Getenv,
+		lookPath:          exec.LookPath,
+		currentCluster:    cluster.CurrentCluster,
+		kubeconfigPath:    cluster.ResolvedKubeconfigPath,
+		prepareKubeconfig: manager.PrepareKubeconfig,
+		stat:              os.Stat,
 		run: func(ctx context.Context, binary string, arguments []string, kubeconfig string, stdin io.Reader, stdout, stderr io.Writer) error {
 			command := exec.CommandContext(ctx, binary, arguments...)
 			command.Stdin = stdin
@@ -66,11 +70,11 @@ func defaultPassthroughEnvironment() passthroughEnvironment {
 }
 
 func tryKubernetesPassthrough(ctx context.Context, arguments []string, stdin io.Reader, stdout, stderr io.Writer, env passthroughEnvironment) (bool, error) {
-	forwarded, explicitCluster, kubernetesCommand, legacy, err := routeKubernetesArguments(arguments)
+	forwarded, explicitCluster, kubernetesCommand, err := routeKubernetesArguments(arguments)
 	if err != nil {
 		return true, err
 	}
-	if legacy || !kubernetesCommand {
+	if !kubernetesCommand {
 		return false, nil
 	}
 
@@ -81,14 +85,22 @@ func tryKubernetesPassthrough(ctx context.Context, arguments []string, stdin io.
 	if clusterName == "" {
 		clusterName, err = env.currentCluster()
 		if errors.Is(err, cluster.ErrNoCurrentCluster) {
-			return false, nil
+			return true, errNoSelectedCluster
 		}
 		if err != nil {
 			return true, err
 		}
+		if clusterName == "" {
+			return true, errNoSelectedCluster
+		}
 	}
 
-	kubeconfig, err := env.kubeconfigPath(clusterName)
+	var kubeconfig string
+	if env.prepareKubeconfig != nil {
+		kubeconfig, err = env.prepareKubeconfig(ctx, clusterName)
+	} else {
+		kubeconfig, err = env.kubeconfigPath(clusterName)
+	}
 	if err != nil {
 		return true, fmt.Errorf("resolve kubeconfig for cluster %q: %w", clusterName, err)
 	}
@@ -104,7 +116,7 @@ func tryKubernetesPassthrough(ctx context.Context, arguments []string, stdin io.
 	}
 	binary, err := env.lookPath("kubectl")
 	if err != nil {
-		return true, fmt.Errorf("kubectl is required for APC v2 workload commands: %w", err)
+		return true, fmt.Errorf("kubectl is required for APC workload commands: %w", err)
 	}
 	if err := env.run(ctx, binary, forwarded, kubeconfig, stdin, stdout, stderr); err != nil {
 		return true, fmt.Errorf("kubectl: %w", err)
@@ -112,29 +124,36 @@ func tryKubernetesPassthrough(ctx context.Context, arguments []string, stdin io.
 	return true, nil
 }
 
-func routeKubernetesArguments(arguments []string) (forwarded []string, clusterName string, kubernetesCommand, legacy bool, err error) {
+func routeKubernetesArguments(arguments []string) (forwarded []string, clusterName string, kubernetesCommand bool, err error) {
 	forwarded = make([]string, 0, len(arguments))
+	literalArguments := false
 	for index := 0; index < len(arguments); index++ {
 		argument := arguments[index]
-		if argument == "--legacy" {
-			return arguments, "", false, true, nil
+		if literalArguments {
+			forwarded = append(forwarded, argument)
+			continue
+		}
+		if kubernetesCommand && argument == "--" {
+			literalArguments = true
+			forwarded = append(forwarded, argument)
+			continue
+		}
+		switch {
+		case argument == "--cluster":
+			if index+1 >= len(arguments) || strings.HasPrefix(arguments[index+1], "-") {
+				return nil, "", false, fmt.Errorf("--cluster requires a name")
+			}
+			clusterName = arguments[index+1]
+			index++
+			continue
+		case strings.HasPrefix(argument, "--cluster="):
+			clusterName = strings.TrimPrefix(argument, "--cluster=")
+			if clusterName == "" {
+				return nil, "", false, fmt.Errorf("--cluster requires a name")
+			}
+			continue
 		}
 		if !kubernetesCommand {
-			switch {
-			case argument == "--cluster":
-				if index+1 >= len(arguments) || strings.HasPrefix(arguments[index+1], "-") {
-					return nil, "", false, false, fmt.Errorf("--cluster requires a name")
-				}
-				clusterName = arguments[index+1]
-				index++
-				continue
-			case strings.HasPrefix(argument, "--cluster="):
-				clusterName = strings.TrimPrefix(argument, "--cluster=")
-				if clusterName == "" {
-					return nil, "", false, false, fmt.Errorf("--cluster requires a name")
-				}
-				continue
-			}
 			if _, takesValue := leadingFlagsWithValues[argument]; takesValue {
 				forwarded = append(forwarded, argument)
 				if index+1 < len(arguments) {
@@ -145,12 +164,12 @@ func routeKubernetesArguments(arguments []string) (forwarded []string, clusterNa
 			}
 			if !strings.HasPrefix(argument, "-") {
 				if _, internal := apcCommands[argument]; internal {
-					return arguments, "", false, false, nil
+					return arguments, "", false, nil
 				}
 				kubernetesCommand = true
 			}
 		}
 		forwarded = append(forwarded, argument)
 	}
-	return forwarded, clusterName, kubernetesCommand, false, nil
+	return forwarded, clusterName, kubernetesCommand, nil
 }

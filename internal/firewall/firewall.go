@@ -39,6 +39,12 @@ func Render(config Config) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if config.Interface == "auto" {
+		config.Interface, err = interfaceForIP(config.LocalIP)
+		if err != nil {
+			return nil, err
+		}
+	}
 	table := tableName(config.Cluster)
 	tcpPorts := []int{config.KubeletPort}
 	if config.Role == "server" {
@@ -173,6 +179,33 @@ func normalize(config Config) (Config, error) {
 	return config, nil
 }
 
+func interfaceForIP(address string) (string, error) {
+	target := net.ParseIP(address)
+	if target == nil {
+		return "", fmt.Errorf("local IP must be a valid IP address")
+	}
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return "", fmt.Errorf("list host network interfaces: %w", err)
+	}
+	for _, networkInterface := range interfaces {
+		addresses, err := networkInterface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, value := range addresses {
+			ip, _, err := net.ParseCIDR(value.String())
+			if err == nil && ip.Equal(target) {
+				if !safeInterface.MatchString(networkInterface.Name) {
+					return "", fmt.Errorf("resolved network interface contains unsupported characters")
+				}
+				return networkInterface.Name, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("local IP %s is not assigned to a host network interface", address)
+}
+
 func runPF(ctx context.Context, stdin []byte, arguments ...string) error {
 	command := exec.CommandContext(ctx, "/sbin/pfctl", arguments...)
 	command.Stdin = bytes.NewReader(stdin)
@@ -188,7 +221,20 @@ func runPF(ctx context.Context, stdin []byte, arguments ...string) error {
 func acquirePFReference(ctx context.Context, cluster string) error {
 	tokenPath := tokenPath(cluster)
 	if token, err := os.ReadFile(tokenPath); err == nil && safeToken(string(token)) {
-		return nil
+		trimmed := strings.TrimSpace(string(token))
+		command := exec.CommandContext(ctx, "/sbin/pfctl", "-s", "References")
+		var output bytes.Buffer
+		command.Stdout = &output
+		command.Stderr = &output
+		if err := command.Run(); err != nil {
+			return commandError("verify PF reference token", output.Bytes(), err)
+		}
+		if referenceContains(output.String(), trimmed) {
+			return nil
+		}
+		if err := os.Remove(tokenPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove stale PF reference token: %w", err)
+		}
 	} else if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("read PF reference token: %w", err)
 	}
@@ -208,6 +254,15 @@ func acquirePFReference(ctx context.Context, cluster string) error {
 		return err
 	}
 	return nil
+}
+
+func referenceContains(output, token string) bool {
+	for _, field := range strings.Fields(output) {
+		if strings.Trim(field, "[](),") == token {
+			return true
+		}
+	}
+	return false
 }
 
 func releasePFReference(ctx context.Context, cluster string) error {
@@ -276,6 +331,17 @@ func writeToken(path string, token []byte) error {
 	if err := temporary.Chmod(0o600); err != nil {
 		_ = temporary.Close()
 		return fmt.Errorf("protect PF reference token: %w", err)
+	}
+	// The privileged installer may inherit the invoking user's primary group
+	// even though its effective UID is root. Verification deliberately requires
+	// root:wheel, so set both owners explicitly before publishing the token.
+	if err := temporary.Chown(0, 0); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("own PF reference token: %w", err)
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("sync PF reference token: %w", err)
 	}
 	if err := temporary.Close(); err != nil {
 		return fmt.Errorf("close PF reference token: %w", err)

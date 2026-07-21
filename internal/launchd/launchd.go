@@ -40,9 +40,20 @@ func (execRunner) Run(ctx context.Context, binary string, arguments ...string) (
 }
 
 type Manager struct {
-	runner commandRunner
-	uid    int
-	home   string
+	runner                 commandRunner
+	uid                    int
+	euid                   int
+	home                   string
+	launchDaemonsDirectory string
+	// launchDaemonsValidationRoot is always "/" in production. Tests may set
+	// a narrower private sandbox root so validation does not depend on the
+	// operating system's shared temporary-directory ancestors.
+	launchDaemonsValidationRoot string
+	lookupAccount               accountLookup
+	lookupGroup                 groupLookup
+	chown                       fileChown
+	ownership                   ownershipLookup
+	directoryOpenedHook         func(string)
 }
 
 func NewManager() (*Manager, error) {
@@ -50,7 +61,13 @@ func NewManager() (*Manager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve home directory: %w", err)
 	}
-	return &Manager{runner: execRunner{}, uid: os.Getuid(), home: home}, nil
+	return &Manager{
+		runner: execRunner{}, uid: os.Getuid(), euid: os.Geteuid(), home: home,
+		launchDaemonsDirectory:      "/Library/LaunchDaemons",
+		launchDaemonsValidationRoot: string(filepath.Separator),
+		lookupAccount:               defaultAccountLookup, lookupGroup: defaultGroupLookup,
+		chown: defaultFileChown, ownership: defaultOwnershipLookup,
+	}, nil
 }
 
 func (m *Manager) Install(ctx context.Context, config Config) (string, error) {
@@ -170,8 +187,8 @@ func Label(config Config) string {
 }
 
 func normalizeConfig(config Config) (Config, error) {
-	if config.Role != "server" && config.Role != "agent" {
-		return Config{}, fmt.Errorf("role must be server or agent")
+	if config.Role != "server" && config.Role != "agent" && config.Role != "ha" {
+		return Config{}, fmt.Errorf("role must be server, agent, or ha")
 	}
 	if !safeName.MatchString(config.Cluster) {
 		return Config{}, fmt.Errorf("cluster name must be a lowercase DNS label")

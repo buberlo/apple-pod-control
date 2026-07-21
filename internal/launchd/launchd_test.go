@@ -40,3 +40,20 @@ func TestNormalizeConfigRejectsUnsafeRoleNameAndFastLoop(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeConfigAcceptsHALocalMemberSupervisor(t *testing.T) {
+	executable := filepath.Join(t.TempDir(), "apc")
+	if err := os.WriteFile(executable, []byte("binary"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config, err := normalizeConfig(Config{Role: "ha", Cluster: "ha-lab", Executable: executable})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if Label(config) != "dev.apc.ha.ha-lab" {
+		t.Fatalf("HA label = %q", Label(config))
+	}
+	if plist := string(RenderPlist(config, "/tmp/ha.log")); !strings.Contains(plist, "<string>ha</string>") {
+		t.Fatalf("HA plist does not preserve role:\n%s", plist)
+	}
+}
