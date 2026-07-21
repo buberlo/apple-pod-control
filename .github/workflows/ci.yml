@@ -18,8 +18,22 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Test
+        run: go test ./...
+      - name: Race test
         run: go test -race ./...
       - name: Vet
         run: go vet ./...
       - name: Build
         run: make build
+      - name: Verify module graph is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+      - name: Validate hardware acceptance harness
+        run: |
+          bash -n scripts/*.sh
+          bash scripts/test-hardware-acceptance.sh
+      - name: Validate Helm example
+        run: |
+          helm lint examples/helm/web
+          helm template web examples/helm/web >/dev/null

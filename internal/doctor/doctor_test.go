@@ -24,6 +24,8 @@ func healthyEnvironment() environment {
 		run: func(_ context.Context, _ string, arguments ...string) (string, error) {
 			joined := strings.Join(arguments, " ")
 			switch joined {
+			case "-n get default":
+				return "route to: default\ninterface: en0", nil
 			case "--version":
 				return "container CLI version 1.0.0 (build: release)", nil
 			case "system status":
@@ -42,6 +44,87 @@ func healthyEnvironment() environment {
 		lookupHost:  func(context.Context, string) ([]string, error) { return []string{"192.0.2.2"}, nil },
 		dialTCP:     func(context.Context, string) error { return nil },
 	}
+}
+
+func TestDefaultRouteDiagnostic(t *testing.T) {
+	tests := []struct {
+		name            string
+		output          string
+		err             error
+		wantStatus      Status
+		wantDetail      string
+		forbiddenDetail string
+	}{
+		{
+			name:       "physical interface",
+			output:     "   route to: default\ninterface: en7\n   gateway: 192.0.2.1",
+			wantStatus: Pass,
+			wantDetail: "non-tunnel interface en7",
+		},
+		{
+			name:       "tunnel interface",
+			output:     "route to: default\n  interface: utun12\nflags: <UP,DONE,STATIC>",
+			wantStatus: Warn,
+			wantDetail: "tunnel interface utun12; VM/pod egress may be affected",
+		},
+		{
+			name:            "lookup unavailable",
+			err:             errors.New("route failed via gateway 192.0.2.1"),
+			wantStatus:      Warn,
+			wantDetail:      "default route lookup unavailable",
+			forbiddenDetail: "192.0.2.1",
+		},
+		{
+			name:            "malformed output",
+			output:          "route to: default\ninterface: en0 injected\ngateway: 192.0.2.1",
+			wantStatus:      Warn,
+			wantDetail:      "default route interface could not be determined",
+			forbiddenDetail: "192.0.2.1",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			env := healthyEnvironment()
+			baseRun := env.run
+			env.run = func(ctx context.Context, binary string, arguments ...string) (string, error) {
+				if binary == "/sbin/route" && strings.Join(arguments, " ") == "-n get default" {
+					return test.output, test.err
+				}
+				return baseRun(ctx, binary, arguments...)
+			}
+
+			report := run(context.Background(), env, Options{Role: "server", Timeout: time.Second})
+			result, ok := findResult(report, "host-default-route")
+			if !ok {
+				t.Fatalf("host-default-route result missing: %#v", report.Results)
+			}
+			if result.Status != test.wantStatus {
+				t.Fatalf("status = %s, want %s: %#v", result.Status, test.wantStatus, result)
+			}
+			if !strings.Contains(result.Detail, test.wantDetail) {
+				t.Fatalf("detail = %q, want substring %q", result.Detail, test.wantDetail)
+			}
+			if test.forbiddenDetail != "" && strings.Contains(result.Detail+result.Remediation, test.forbiddenDetail) {
+				t.Fatalf("diagnostic leaked sensitive route output: %#v", result)
+			}
+		})
+	}
+}
+
+func TestParseDefaultRouteInterfaceRejectsConflictingInterfaces(t *testing.T) {
+	if interfaceName, ok := parseDefaultRouteInterface("interface: en0\ninterface: utun4"); ok {
+		t.Fatalf("parse succeeded with conflicting interface %q", interfaceName)
+	}
+}
+
+func findResult(report Report, name string) (Result, bool) {
+	for _, result := range report.Results {
+		if result.Name == name {
+			return result, true
+		}
+	}
+	return Result{}, false
 }
 
 func TestHealthyServerReportOnlyWarnsAboutMachinePortPublishing(t *testing.T) {

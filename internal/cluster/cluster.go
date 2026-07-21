@@ -117,10 +117,11 @@ func (execRunner) RunIO(ctx context.Context, binary string, arguments []string, 
 }
 
 type Manager struct {
-	binary  string
-	runner  commandRunner
-	stream  streamCommandRunner
-	dialTCP func(context.Context, string) error
+	binary     string
+	runner     commandRunner
+	stream     streamCommandRunner
+	dialTCP    func(context.Context, string) error
+	probeHAAPI func(context.Context, HAConfig, HAMember) bool
 }
 
 func NewManager(binary string) *Manager {
@@ -134,7 +135,7 @@ func NewManager(binary string) *Manager {
 			binary = "/usr/local/bin/container"
 		}
 	}
-	return &Manager{
+	manager := &Manager{
 		binary: binary,
 		runner: execRunner{},
 		stream: execRunner{},
@@ -146,6 +147,8 @@ func NewManager(binary string) *Manager {
 			return connection.Close()
 		},
 	}
+	manager.probeHAAPI = manager.probeHAHostAPI
+	return manager
 }
 
 func (m *Manager) Create(ctx context.Context, config Config) (State, error) {
@@ -455,6 +458,34 @@ func (m *Manager) AgentStatus(ctx context.Context, name string) (State, error) {
 }
 
 func (m *Manager) Kubectl(ctx context.Context, name string, arguments ...string) ([]byte, []byte, error) {
+	haConfig, haErr := loadHAConfig(name)
+	if haErr == nil {
+		for _, member := range haConfig.Members {
+			record, inspectErr := m.inspectHAContainer(ctx, HAContainerName(name, member.ID))
+			if errors.Is(inspectErr, ErrNotFound) {
+				continue
+			}
+			if inspectErr != nil {
+				return nil, nil, inspectErr
+			}
+			if err := validateHAContainer(record, haConfig, member); err != nil {
+				return nil, nil, err
+			}
+			if !strings.EqualFold(record.Status.State, "running") {
+				continue
+			}
+			node, nodeErr := m.readHAMemberNode(ctx, haConfig, member)
+			if nodeErr != nil || !nodeDocumentReady(node) {
+				continue
+			}
+			commandArguments := append([]string{"exec", HAContainerName(name, member.ID), "kubectl"}, arguments...)
+			return m.runner.Run(ctx, m.binary, commandArguments...)
+		}
+		return nil, nil, fmt.Errorf("HA cluster %q has no running Ready server", name)
+	}
+	if !errors.Is(haErr, os.ErrNotExist) {
+		return nil, nil, haErr
+	}
 	record, err := m.inspect(ctx, ContainerName(name))
 	if err != nil {
 		return nil, nil, err
@@ -691,6 +722,13 @@ func ResolvedKubeconfigPath(clusterName string) (string, error) {
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		return "", err
+	}
+	haConfig, haErr := loadHAConfig(clusterName)
+	if haErr == nil {
+		return haConfig.KubeconfigPath, nil
+	}
+	if !errors.Is(haErr, os.ErrNotExist) {
+		return "", haErr
 	}
 	return KubeconfigPath(clusterName)
 }
