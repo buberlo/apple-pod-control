@@ -1,16 +1,15 @@
-# Apple Pod Control
+# Apple Pod Control (APC)
 
-Apple Pod Control (APC) runs **real Kubernetes with K3s** in lightweight,
-native ARM64 virtual machines created by
-[`apple/container` 1.0](https://github.com/apple/container). APC is the
-Apple-host and cluster-lifecycle layer: it creates node VMs, preserves their
-data, manages kubeconfigs, moves images, diagnoses the outer VM network and
-provides safe backup, recovery and macOS supervision.
+[![CI](https://github.com/buberlo/apple-pod-control/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/buberlo/apple-pod-control/actions/workflows/ci.yml)
 
-K3s—not APC—owns the Kubernetes API, desired state, controllers, scheduler,
-Pods, Deployments, Services, Secrets, Jobs, storage and embedded etcd. Workload
-commands are passed to native `kubectl`; `apc helm` passes through to native
-Helm. This keeps the Kubernetes behavior and ecosystem people already know.
+APC runs K3s clusters in lightweight native ARM64 virtual machines created
+with [`apple/container` 1.0](https://github.com/apple/container). It manages VM
+and volume lifecycle, kubeconfigs, image transport, network diagnostics,
+backups, recovery and macOS supervision.
+
+K3s owns the Kubernetes API and workload state. APC forwards workload commands
+to native `kubectl`, while `apc helm` forwards to native Helm, preserving the
+standard Kubernetes behavior and tooling people already know.
 
 > Project status: development and trusted-LAN lab. The implementation has
 > substantial live Apple-Silicon validation, but it is not production-ready.
